@@ -1,0 +1,27 @@
+<annotation>
+	<folder></folder>
+	<filename>20211027_200135-removebg-preview_png.rf.3cbe5607e689baeb8ecd5dd23c68fd0f.jpg</filename>
+	<path>20211027_200135-removebg-preview_png.rf.3cbe5607e689baeb8ecd5dd23c68fd0f.jpg</path>
+	<source>
+		<database>roboflow.ai</database>
+	</source>
+	<size>
+		<width>416</width>
+		<height>416</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>curl_stage1</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<occluded>0</occluded>
+		<bndbox>
+			<xmin>148</xmin>
+			<xmax>253</xmax>
+			<ymin>187</ymin>
+			<ymax>298</ymax>
+		</bndbox>
+	</object>
+</annotation>
