@@ -11,67 +11,122 @@ def cxcywh_to_xyxy(boxes):
     y2 = cy + h / 2
     return torch.stack((x1, y1, x2, y2), dim=-1)
 
+def giou_loss(pred_boxes_xyxy, gt_boxes_xyxy, reduction="none"):
+    """
+    Calculate GIoU loss.
+    Args:
+        pred_boxes_xyxy (Tensor): Predicted boxes, shape (N, 4), format (x1, y1, x2, y2)
+        gt_boxes_xyxy (Tensor): Ground truth boxes, shape (N, 4), format (x1, y1, x2, y2)
+    Returns:
+        Tensor: GIoU loss
+    """
+    # Intersection
+    inter_x1 = torch.max(pred_boxes_xyxy[:, 0], gt_boxes_xyxy[:, 0])
+    inter_y1 = torch.max(pred_boxes_xyxy[:, 1], gt_boxes_xyxy[:, 1])
+    inter_x2 = torch.min(pred_boxes_xyxy[:, 2], gt_boxes_xyxy[:, 2])
+    inter_y2 = torch.min(pred_boxes_xyxy[:, 3], gt_boxes_xyxy[:, 3])
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+
+    # Union
+    pred_area = (pred_boxes_xyxy[:, 2] - pred_boxes_xyxy[:, 0]) * (pred_boxes_xyxy[:, 3] - pred_boxes_xyxy[:, 1])
+    gt_area = (gt_boxes_xyxy[:, 2] - gt_boxes_xyxy[:, 0]) * (gt_boxes_xyxy[:, 3] - gt_boxes_xyxy[:, 1])
+    union_area = pred_area + gt_area - inter_area
+    
+    # IoU
+    iou = inter_area / (union_area + 1e-6)
+
+    # Bounding box of the union
+    c_x1 = torch.min(pred_boxes_xyxy[:, 0], gt_boxes_xyxy[:, 0])
+    c_y1 = torch.min(pred_boxes_xyxy[:, 1], gt_boxes_xyxy[:, 1])
+    c_x2 = torch.max(pred_boxes_xyxy[:, 2], gt_boxes_xyxy[:, 2])
+    c_y2 = torch.max(pred_boxes_xyxy[:, 3], gt_boxes_xyxy[:, 3])
+    c_area = (c_x2 - c_x1) * (c_y2 - c_y1)
+    
+    giou = iou - (c_area - union_area) / (c_area + 1e-6)
+    
+    loss = 1.0 - giou
+    
+    if reduction == "sum":
+        return loss.sum()
+    elif reduction == "mean":
+        return loss.mean()
+    else: # "none"
+        return loss
+
 class YOLOXLoss(nn.Module):
-    def __init__(self, num_classes, stride=16.0):
+    def __init__(self, num_classes, strides=[8, 16, 32]):
         super().__init__()
         self.num_classes = num_classes
-        self.stride = stride
+        self.strides = strides
 
         self.bce_loss = nn.BCEWithLogitsLoss(reduction="none")
         # In YOLOX, the regression loss is often an IoU-based loss (like GIoU) or L1 loss on the decoded boxes.
-        # We will use L1 loss here for simplicity and effectiveness, as it's a common choice.
-        self.iou_loss = nn.L1Loss(reduction="none") 
+        # We will use GIoU loss, which is generally better for object detection.
+        self.iou_loss = giou_loss
         
         # SimOTA parameters
         self.center_sampling_radius = 2.5
         self.topk_candidates = 10
         self.reg_weight = 5.0 # Weight for the regression loss
 
-    def forward(self, prediction_maps, targets):
+    def forward(self, fpn_outputs, targets):
         """
         Args:
-            prediction_maps (tuple): (cls_pred, reg_pred, obj_pred) from the model
-                - cls_pred: (B, C, H, W)
-                - reg_pred: (B, 4, H, W)
-                - obj_pred: (B, 1, H, W)
+            fpn_outputs (list of Tensors): Output from the YOLOXHead, a list of [B, 5+C, H, W] tensors.
             targets (list of Tensors): List of [num_gt, 5] tensors -> [x1, y1, x2, y2, class_id]
         """
-        cls_preds_map, reg_preds_map, obj_preds_map = prediction_maps
-        device = cls_preds_map.device
+        device = targets[0].device
+        batch_size = fpn_outputs[0].shape[0]
 
-        batch_size, _, H, W = cls_preds_map.shape
-        num_predictions = H * W
-        
-        # 1. DECODE PREDICTIONS: Convert raw feature maps to a usable format
-        # Flatten predictions from (B, C, H, W) to (B, H*W, C)
-        cls_preds = cls_preds_map.permute(0, 2, 3, 1).reshape(batch_size, num_predictions, self.num_classes)
-        reg_preds = reg_preds_map.permute(0, 2, 3, 1).reshape(batch_size, num_predictions, 4)
-        obj_preds = obj_preds_map.permute(0, 2, 3, 1).reshape(batch_size, num_predictions, 1)
+        # 1. DECODE PREDICTIONS FROM ALL FPN LEVELS
+        all_cls_preds, all_reg_preds, all_obj_preds, all_strides = [], [], [], []
 
-        # Generate grid coordinates needed for decoding
-        yv, xv = torch.meshgrid([torch.arange(H), torch.arange(W)], indexing="ij")
-        grid = torch.stack((xv, yv), 2).view(1, num_predictions, 2).to(device)
-        
-        # Decode regression predictions to (cx, cy, w, h) format
-        decoded_reg_preds = torch.clone(reg_preds)
-        decoded_reg_preds[..., :2] = (reg_preds[..., :2] + grid) * self.stride
-        decoded_reg_preds[..., 2:] = torch.exp(reg_preds[..., 2:]) * self.stride
+        for i, fpn_out in enumerate(fpn_outputs):
+            stride = self.strides[i]
+            B, _, H, W = fpn_out.shape
+            
+            # Generate grid and reshape raw output
+            yv, xv = torch.meshgrid([torch.arange(H), torch.arange(W)], indexing="ij")
+            grid = torch.stack((xv, yv), 2).view(1, -1, 2).to(device)
+            
+            fpn_out = fpn_out.permute(0, 2, 3, 1).reshape(B, -1, 5 + self.num_classes)
+            
+            # Split into regression, objectness, and classification predictions
+            reg_preds = fpn_out[..., :4]
+            obj_preds = fpn_out[..., 4:5]
+            cls_preds = fpn_out[..., 5:]
+            
+            # Decode regression predictions
+            decoded_reg_preds = torch.clone(reg_preds)
+            decoded_reg_preds[..., :2] = (reg_preds[..., :2] + grid) * stride
+            decoded_reg_preds[..., 2:] = torch.exp(reg_preds[..., 2:]) * stride
+            
+            all_reg_preds.append(decoded_reg_preds)
+            all_obj_preds.append(obj_preds)
+            all_cls_preds.append(cls_preds)
+            all_strides.append(torch.full((B, grid.shape[1], 1), stride, device=device))
+
+        # Concatenate predictions from all levels
+        cat_reg_preds = torch.cat(all_reg_preds, dim=1)
+        cat_obj_preds = torch.cat(all_obj_preds, dim=1)
+        cat_cls_preds = torch.cat(all_cls_preds, dim=1)
+        cat_strides = torch.cat(all_strides, dim=1)
         
         total_cls_loss = 0.0
         total_reg_loss = 0.0
         total_obj_loss = 0.0
-        num_fg = 0.0 # Total number of positive assignments (foreground)
+        num_fg = 0.0 # Total number of positive assignments
 
-        # 2. PERFORM LABEL ASSIGNMENT (SimOTA) for each image in the batch
+        # 2. PERFORM LABEL ASSIGNMENT (SimOTA) for each image
         for b in range(batch_size):
-            pred_cls_b = cls_preds[b]      # (H*W, C)
-            pred_box_b = decoded_reg_preds[b] # (H*W, 4) in cxcywh format
-            pred_obj_b = obj_preds[b]      # (H*W, 1)
-            target_b = targets[b]          # (num_gt, 5) in xyxy format
+            pred_cls_b = cat_cls_preds[b]
+            pred_box_b = cat_reg_preds[b]
+            pred_obj_b = cat_obj_preds[b]
+            strides_b = cat_strides[b]
+            target_b = targets[b]
 
             num_gt = target_b.shape[0]
             
-            # If there are no ground truth objects, loss is only objectness loss for the background
             if num_gt == 0:
                 obj_target = torch.zeros_like(pred_obj_b)
                 loss_obj = self.bce_loss(pred_obj_b, obj_target).sum()
@@ -80,14 +135,13 @@ class YOLOXLoss(nn.Module):
             
             # 3. Get positive assignments using SimOTA
             fg_mask, assigned_gt_inds = self.get_assignments(
-                pred_cls_b, pred_box_b, pred_obj_b, target_b
+                pred_cls_b, pred_box_b, pred_obj_b, target_b, strides_b
             )
             num_fg += fg_mask.sum()
             
-            # 4. Prepare targets for the assigned positive predictions
-            assigned_gts = target_b[assigned_gt_inds] # (num_fg, 5)
+            # 4. Prepare targets
+            assigned_gts = target_b[assigned_gt_inds]
             
-            # Create regression target (cxcywh format)
             gt_boxes_cxcywh = torch.stack((
                 (assigned_gts[:, 0] + assigned_gts[:, 2]) / 2,
                 (assigned_gts[:, 1] + assigned_gts[:, 3]) / 2,
@@ -97,10 +151,13 @@ class YOLOXLoss(nn.Module):
             
             cls_target = F.one_hot(assigned_gts[:, 4].long(), self.num_classes).float()
             obj_target = torch.zeros_like(pred_obj_b)
-            obj_target[fg_mask] = 1.0 # Set objectness to 1 for positive assignments
+            obj_target[fg_mask] = 1.0 # Objectness is 1 for positive predictions
 
             # 5. Calculate Losses
-            loss_reg = self.iou_loss(pred_box_b[fg_mask], gt_boxes_cxcywh).sum()
+            pred_xyxy = cxcywh_to_xyxy(pred_box_b[fg_mask])
+            gt_xyxy = cxcywh_to_xyxy(gt_boxes_cxcywh)
+
+            loss_reg = self.iou_loss(pred_xyxy, gt_xyxy, reduction="sum")
             loss_cls = self.bce_loss(pred_cls_b[fg_mask], cls_target).sum()
             loss_obj = self.bce_loss(pred_obj_b, obj_target).sum()
             
@@ -115,27 +172,26 @@ class YOLOXLoss(nn.Module):
         return total_loss
 
     @torch.no_grad()
-    def get_assignments(self, pred_cls, pred_box_cxcywh, pred_obj, target):
-        """SimOTA label assignment logic."""
+    def get_assignments(self, pred_cls, pred_box_cxcywh, pred_obj, target, strides_tensor):
+        """SimOTA for multi-level predictions."""
         num_preds = pred_cls.shape[0]
         num_gt = target.shape[0]
         
         gt_boxes_xyxy = target[:, :4]
         gt_classes = target[:, 4]
 
-        # Preliminary filtering
+        # Preliminary filtering using box centers
         gt_center = (gt_boxes_xyxy[:, :2] + gt_boxes_xyxy[:, 2:]) / 2
         pred_box_xyxy = cxcywh_to_xyxy(pred_box_cxcywh)
         
-        is_in_box_and_center = self.get_in_box_info(pred_box_xyxy, gt_center, gt_boxes_xyxy)
+        is_in_box_and_center = self.get_in_box_info(pred_box_xyxy, gt_center, gt_boxes_xyxy, strides_tensor)
 
         # Cost matrix calculation
         ious = self.calculate_iou(pred_box_xyxy, gt_boxes_xyxy)
         reg_cost = -torch.log(ious + 1e-8)
         
-        pred_cls_sigmoid = torch.sigmoid(pred_cls)
         cls_cost = F.binary_cross_entropy(
-            pred_cls_sigmoid.unsqueeze(1).repeat(1, num_gt, 1),
+            torch.sigmoid(pred_cls).unsqueeze(1).repeat(1, num_gt, 1),
             F.one_hot(gt_classes.long(), self.num_classes).float().unsqueeze(0).repeat(num_preds, 1, 1),
             reduction="none"
         ).sum(-1)
@@ -159,9 +215,9 @@ class YOLOXLoss(nn.Module):
         
         return fg_mask, assigned_gt_inds[fg_mask]
         
-    def get_in_box_info(self, pred_boxes, gt_centers, gt_boxes):
+    def get_in_box_info(self, pred_boxes, gt_centers, gt_boxes, strides_tensor):
         pred_centers = (pred_boxes[:, :2] + pred_boxes[:, 2:]) / 2
-        
+
         x1, y1, x2, y2 = gt_boxes.unbind(-1)
         is_in_gts = (
             (pred_centers[:, 0].unsqueeze(1) > x1) & (pred_centers[:, 0].unsqueeze(1) < x2) &
@@ -169,7 +225,7 @@ class YOLOXLoss(nn.Module):
         )
         
         dist = torch.cdist(pred_centers, gt_centers)
-        is_in_radius = dist < self.center_sampling_radius * self.stride
+        is_in_radius = dist < self.center_sampling_radius * strides_tensor
         
         return is_in_gts & is_in_radius
 
