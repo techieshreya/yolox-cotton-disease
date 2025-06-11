@@ -28,37 +28,75 @@ def cxcywh_to_xyxy(boxes):
     y2 = y_center + h / 2
     return torch.stack([x1, y1, x2, y2], dim=1)
 
-def postprocess(prediction, num_classes, conf_thre=0.01, nms_thre=0.5):
-    cls_preds, reg_preds, obj_preds = prediction
-    cls_preds = torch.sigmoid(cls_preds)
-    obj_preds = torch.sigmoid(obj_preds)
-    scores = cls_preds * obj_preds
+def postprocess(predictions, strides, num_classes, conf_thre=0.01, nms_thre=0.5):
+    """
+    Post-processes raw predictions from the model.
+    'predictions': A list of 3 tensors, one for each FPN level.
+                   Each tensor is of shape [N, C, H, W] where N is the total number of images.
+    'strides': A tensor of strides for each FPN level.
+    """
+    all_detections = []
+    device = predictions[0].device
     
-    batch_size = cls_preds.shape[0]
-    output = [None] * batch_size
+    # 1. Decode predictions from all levels
+    decoded_preds = []
+    for i, preds_level in enumerate(predictions):
+        stride = strides[i]
+        N, C, H, W = preds_level.shape
+        
+        # Create grid
+        yv, xv = torch.meshgrid([torch.arange(H, device=device), torch.arange(W, device=device)], indexing="ij")
+        grid = torch.stack((xv, yv), 2).view(1, H*W, 2).repeat(N, 1, 1) # Shape: [N, H*W, 2]
+        
+        # Reshape and decode
+        preds_level = preds_level.permute(0, 2, 3, 1).reshape(N, H*W, C) # Shape: [N, H*W, C]
+        
+        box_xy = (preds_level[..., :2] + grid) * stride
+        box_wh = torch.exp(preds_level[..., 2:4]) * stride
+        
+        # Combine decoded boxes with obj and cls scores (still logits)
+        decoded_level = torch.cat((box_xy, box_wh, preds_level[..., 4:]), dim=-1)
+        decoded_preds.append(decoded_level)
+        
+    output = torch.cat(decoded_preds, dim=1) # Shape: [N_images, total_anchors, 5+C]
 
-    for i in range(batch_size):
-        class_conf, class_pred = torch.max(scores[i], 1)
-        conf_mask = (class_conf >= conf_thre)
+    # 2. Loop through images in the batch to perform NMS
+    for i in range(output.shape[0]):
+        image_preds = output[i] # Shape: [total_anchors, 5+C]
+        
+        # Apply score threshold
+        obj_score = image_preds[:, 4].sigmoid()
+        cls_scores = image_preds[:, 5:].sigmoid()
+        
+        class_conf, class_pred = torch.max(cls_scores, 1)
+        final_scores = obj_score * class_conf
+        
+        conf_mask = (final_scores >= conf_thre)
+        
+        # Convert boxes from [cx, cy, w, h] to [x1, y1, x2, y2]
+        boxes_cxcywh = image_preds[:, :4][conf_mask]
+        x_center, y_center, w, h = boxes_cxcywh.T
+        x1 = x_center - w / 2
+        y1 = y_center - h / 2
+        x2 = x_center + w / 2
+        y2 = y_center + h / 2
+        boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=1)
         
         detections = torch.cat((
-            reg_preds[i][conf_mask],
-            class_conf[conf_mask].unsqueeze(1),
+            boxes_xyxy,
+            final_scores[conf_mask].unsqueeze(1),
             class_pred[conf_mask].unsqueeze(1).float()
         ), 1)
 
         if not detections.shape[0]:
-            output[i] = torch.empty((0, 6), device=cls_preds.device)
+            all_detections.append(torch.empty((0, 6), device=device))
             continue
             
-        boxes_xyxy = cxcywh_to_xyxy(detections[:, :4])
-        nms_out_index = ops.nms(boxes_xyxy, detections[:, 4], nms_thre)
+        # Perform NMS
+        nms_out_index = ops.nms(detections[:, :4], detections[:, 4], nms_thre)
+        all_detections.append(detections[nms_out_index])
         
-        final_detections = detections[nms_out_index]
-        final_boxes_xyxy = boxes_xyxy[nms_out_index]
-        
-        output[i] = torch.cat((final_boxes_xyxy, final_detections[:, 4:]), 1)
-    return output
+    return all_detections
 
 def calculate_map(pred_results, true_boxes, true_classes, iou_threshold=0.5):
     if pred_results.shape[0] == 0:
@@ -170,22 +208,29 @@ def train(args):
     )
 
     # Model, Optimizer, Loss
-    model = YOLOX(
-        num_classes=args.num_classes, depth_multiple=args.depth_multiple, width_multiple=args.width_multiple
-    ).to(device)
+    model = YOLOX(num_classes=args.num_classes, phi=args.phi).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     
-    # ---------- FIX 3: Pass model's stride to the Loss function ----------
-    criterion = YOLOXLoss(num_classes=args.num_classes, stride=model.stride)
-    # criterion.reg_weight = 5.0 # This is now handled inside the loss class, can be removed
+    # Add a learning rate warmup scheduler
+    warmup_epochs = 5
+    lr_warmup_factor = 1.0 / warmup_epochs
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.01
+    )
+    
+    criterion = YOLOXLoss(num_classes=args.num_classes, strides=model.stride.tolist())
 
     best_map = 0.0
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
 
+        # LR Warmup
+        if epoch < warmup_epochs:
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group['lr'] = args.lr * (epoch + 1) * lr_warmup_factor
+        
         for images, targets_xyxy in tqdm(train_loader, desc=f'Train Epoch {epoch+1}/{args.epochs}'):
             images = images.to(device)
             targets_xyxy = [t.to(device) for t in targets_xyxy]
@@ -203,51 +248,61 @@ def train(args):
         model.eval()
         val_loss = 0.0
         all_aps = []
+        # The new model's output is a list of tensors, one for each FPN level
+        # We need a new way to store predictions for post-processing
+        output_predictions = []
 
         with torch.no_grad():
             for batch_idx, (images, targets_xyxy) in enumerate(tqdm(val_loader, desc='Validating')):
                 images = images.to(device)
                 targets_xyxy_device = [t.to(device) for t in targets_xyxy]
 
-                cls_preds, reg_preds, obj_preds, decoded_reg_preds = model(images)
-                val_loss_batch = criterion((cls_preds, reg_preds, obj_preds), targets_xyxy_device)
+                outputs = model(images)
+                val_loss_batch = criterion(outputs, targets_xyxy_device)
                 val_loss += val_loss_batch.item()
                 
-                B, _, H, W = cls_preds.shape
-                cls_preds = cls_preds.permute(0, 2, 3, 1).reshape(B, -1, args.num_classes)
-                decoded_reg_preds = decoded_reg_preds.permute(0, 2, 3, 1).reshape(B, -1, 4)
-                obj_preds = obj_preds.permute(0, 2, 3, 1).reshape(B, -1, 1)
+                # Store raw outputs for post-processing after the loop
+                # This gathers all predictions from all batches
+                if batch_idx == 0:
+                    for level_out in outputs:
+                        output_predictions.append(level_out)
+                else:
+                    for i, level_out in enumerate(outputs):
+                        output_predictions[i] = torch.cat((output_predictions[i], level_out), dim=0)
 
-                final_detections = postprocess(
-                    (cls_preds, decoded_reg_preds, obj_preds),
-                    args.num_classes,
-                    conf_thre=0.01,
-                    nms_thre=0.5
+            # Perform post-processing on all validation data at once
+            final_detections = postprocess(output_predictions, model.stride.to(device), args.num_classes)
+
+            for i in range(len(final_detections)):
+                pred_results_np = final_detections[i].cpu().numpy()
+                # We need to get the correct ground truth for each image
+                # This assumes val_loader batch size is consistent, which is typical
+                gt_idx = i 
+                gt_target = val_dataset[gt_idx][1].numpy()
+
+                if gt_target.shape[0] > 0:
+                    gt_boxes = gt_target[:, :4]
+                    gt_classes = gt_target[:, 4]
+                    ap = calculate_map(pred_results_np, gt_boxes, gt_classes)
+                    all_aps.append(ap)
+
+            if epoch % 5 == 0: # Visualize every 5 epochs
+                # Get the first image of the validation set for visualization
+                first_image, first_gt = val_dataset[0]
+                visualize_predictions(
+                    first_image,
+                    final_detections[0].cpu().numpy(),
+                    first_gt[:, :4].cpu().numpy(),
+                    epoch,
+                    args.save_dir
                 )
-
-                for i in range(len(final_detections)):
-                    pred_results_np = final_detections[i].cpu().numpy()
-                    gt_target = targets_xyxy[i].numpy()
-                    if gt_target.shape[0] > 0:
-                        gt_boxes = gt_target[:, :4]
-                        gt_classes = gt_target[:, 4]
-                        ap = calculate_map(pred_results_np, gt_boxes, gt_classes)
-                        all_aps.append(ap)
-
-                if batch_idx == 0 and epoch % 5 == 0: # Visualize every 5 epochs to reduce clutter
-                    visualize_predictions(
-                        images[0],
-                        final_detections[0].cpu().numpy(),
-                        targets_xyxy[0][:, :4].cpu().numpy(),
-                        epoch,
-                        args.save_dir
-                    )
 
         mean_ap = np.mean(all_aps) if len(all_aps) > 0 else 0.0
         
-        # ---------- FIX 2: Correct Scheduler Step ----------
-        scheduler.step() 
-
+        # Scheduler Step
+        if epoch >= warmup_epochs:
+            main_scheduler.step()
+        
         print(f'Epoch {epoch+1}/{args.epochs} | '
               f'Train Loss: {train_loss/len(train_loader):.4f} | '
               f'Val Loss: {val_loss/len(val_loader):.4f} | '
@@ -272,10 +327,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='YOLOX Training Script')
     parser.add_argument('--input_size', type=int, nargs=2, default=[640, 640], help='Model input size [height, width]')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of object classes')
-    parser.add_argument('--depth_multiple', type=float, default=0.33, help='Depth multiplier for model scaling')
-    parser.add_argument('--width_multiple', type=float, default=0.50, help='Width multiplier for model scaling')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs') # Increased epochs
+    parser.add_argument('--phi', type=str, default='s', help="Model size: 's', 'm', 'l', 'x'")
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=150, help='Number of training epochs') # Increased epochs
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of workers for data loading (0 for Windows is often safest)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Directory to save checkpoints')
