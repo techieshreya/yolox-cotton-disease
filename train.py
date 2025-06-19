@@ -7,6 +7,9 @@ from tqdm import tqdm
 import argparse
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import time
+import xml.etree.ElementTree as ET
+from collections import Counter
 
 # Local imports
 from utils.dataset import CottonDiseaseDataset, get_train_augs, get_val_augs
@@ -152,6 +155,20 @@ def calculate_iou(box1, boxes):
     union = area1 + area2 - intersection
     return intersection / (union + 1e-6)
 
+def calculate_map_per_class(pred_results, true_boxes, true_classes, num_classes, iou_threshold=0.5):
+    aps = []
+    for cls in range(num_classes):
+        pred_mask = pred_results[:, 5] == cls
+        gt_mask = true_classes == cls
+        ap = calculate_map(
+            pred_results[pred_mask], 
+            true_boxes[gt_mask], 
+            true_classes[gt_mask], 
+            iou_threshold
+        )
+        aps.append(ap)
+    return aps
+
 def visualize_predictions(image, pred_boxes, gt_boxes, epoch, save_dir):
     fig, ax = plt.subplots(1, figsize=(12, 8))
     image = image.cpu().permute(1, 2, 0).numpy()
@@ -252,6 +269,7 @@ def train(args):
         # We need a new way to store predictions for post-processing
         output_predictions = []
 
+        start_time = time.time()
         with torch.no_grad():
             for batch_idx, (images, targets_xyxy) in enumerate(tqdm(val_loader, desc='Validating')):
                 images = images.to(device)
@@ -273,6 +291,7 @@ def train(args):
             # Perform post-processing on all validation data at once
             final_detections = postprocess(output_predictions, model.stride.to(device), args.num_classes)
 
+            per_class_aps = np.zeros(args.num_classes)
             for i in range(len(final_detections)):
                 pred_results_np = final_detections[i].cpu().numpy()
                 # We need to get the correct ground truth for each image
@@ -283,8 +302,11 @@ def train(args):
                 if gt_target.shape[0] > 0:
                     gt_boxes = gt_target[:, :4]
                     gt_classes = gt_target[:, 4]
-                    ap = calculate_map(pred_results_np, gt_boxes, gt_classes)
-                    all_aps.append(ap)
+                    aps = calculate_map_per_class(pred_results_np, gt_boxes, gt_classes, args.num_classes)
+                    per_class_aps += np.array(aps)
+
+            inference_time = time.time() - start_time
+            per_class_aps /= len(final_detections)
 
             if epoch % 5 == 0: # Visualize every 5 epochs
                 # Get the first image of the validation set for visualization
@@ -297,7 +319,7 @@ def train(args):
                     args.save_dir
                 )
 
-        mean_ap = np.mean(all_aps) if len(all_aps) > 0 else 0.0
+        mean_ap = np.mean(per_class_aps) if len(per_class_aps) > 0 else 0.0
         
         # Scheduler Step
         if epoch >= warmup_epochs:
@@ -307,6 +329,12 @@ def train(args):
               f'Train Loss: {train_loss/len(train_loader):.4f} | '
               f'Val Loss: {val_loss/len(val_loader):.4f} | '
               f'mAP@0.5: {mean_ap:.4f} | '
+              f'AP (Curl stage-1): {per_class_aps[0]:.4f} | '
+              f'AP (Curl stage-2): {per_class_aps[1]:.4f} | '
+              f'AP (Healthy): {per_class_aps[2]:.4f} | '
+              f'AP (Leaf Enation): {per_class_aps[3]:.4f} | '
+              f'AP (Sooty): {per_class_aps[4]:.4f} | '
+              f'Inference Time: {inference_time:.4f}s | '
               f'LR: {optimizer.param_groups[0]["lr"]:.2e}')
 
         if mean_ap > best_map:
@@ -326,7 +354,7 @@ def train(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='YOLOX Training Script')
     parser.add_argument('--input_size', type=int, nargs=2, default=[640, 640], help='Model input size [height, width]')
-    parser.add_argument('--num_classes', type=int, default=2, help='Number of object classes')
+    parser.add_argument('--num_classes', type=int, default=5, help='Number of object classes')
     parser.add_argument('--phi', type=str, default='s', help="Model size: 's', 'm', 'l', 'x'")
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=150, help='Number of training epochs') # Increased epochs
