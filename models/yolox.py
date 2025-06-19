@@ -49,6 +49,52 @@ class Bottleneck(nn.Module):
             y = y + x
         return y
 
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1   = nn.Conv2d(in_planes, in_planes // 16, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2   = nn.Conv2d(in_planes // 16, in_planes, 1, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = self.ca(x) * x
+        x = self.sa(x) * x
+        return x
+
 class CSPLayer(nn.Module):
     """C3 in yolov5, CSP Bottleneck with 3 convolutions"""
     def __init__(self, in_channels, out_channels, n=1, shortcut=True, expansion=0.5):
@@ -58,28 +104,31 @@ class CSPLayer(nn.Module):
         self.conv2 = BaseConv(in_channels, hidden_channels, 1, 1)
         self.conv3 = BaseConv(2 * hidden_channels, out_channels, 1, 1)
         self.m = nn.Sequential(*[Bottleneck(hidden_channels, hidden_channels, shortcut, expansion=1.0) for _ in range(n)])
+        self.attn = CBAM(out_channels)
 
     def forward(self, x):
         x_1 = self.conv1(x)
         x_2 = self.conv2(x)
         x_1 = self.m(x_1)
         x = torch.cat((x_1, x_2), dim=1)
-        return self.conv3(x)
+        x = self.conv3(x)
+        return self.attn(x)
 
-class SPPF(nn.Module):
-    """Spatial Pyramid Pooling - Fast (SPPF) layer"""
+class SimSPPF(nn.Module):
+    """Simplified SPPF layer for YOLOv6"""
     def __init__(self, in_channels, out_channels, k=5):
         super().__init__()
-        c_ = in_channels // 2
-        self.conv1 = BaseConv(in_channels, c_, 1, 1)
-        self.conv2 = BaseConv(c_ * 4, out_channels, 1, 1)
+        c_ = in_channels // 2  # hidden channels
+        self.cv1 = BaseConv(in_channels, c_, 1, 1)
+        self.cv2 = BaseConv(c_ * 4, out_channels, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x):
-        x = self.conv1(x)
-        y1 = self.m(x)
-        y2 = self.m(y1)
-        return self.conv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+        x = self.cv1(x)
+        with torch.cuda.amp.autocast(enabled=False):
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
 
 # YOLOX Architecture -------------------------------------------------------------
 
@@ -104,7 +153,7 @@ class CSPDarknet(nn.Module):
         )
         self.dark5 = nn.Sequential(
             BaseConv(base_channels * 8, base_channels * 16, 3, 2),
-            SPPF(base_channels * 16, base_channels * 16),
+            SimSPPF(base_channels * 16, base_channels * 16),
             CSPLayer(base_channels * 16, base_channels * 16, n=base_depth, shortcut=False),
         )
         self.out_features = out_features
@@ -209,15 +258,16 @@ class YOLOXHead(nn.Module):
     def forward(self, fpn_feats):
         outputs = []
         for i, (feat, stem) in enumerate(zip(fpn_feats, self.stems)):
-            cls_x = stem(feat)
-            reg_x = stem(feat)
+            with torch.cuda.amp.autocast(enabled=False):
+                cls_x = stem(feat.float())
+                reg_x = stem(feat.float())
 
-            cls_feat = self.cls_convs[i](cls_x)
-            cls_output = self.cls_preds[i](cls_feat)
+                cls_feat = self.cls_convs[i](cls_x)
+                cls_output = self.cls_preds[i](cls_feat)
 
-            reg_feat = self.reg_convs[i](reg_x)
-            reg_output = self.reg_preds[i](reg_feat)
-            obj_output = self.obj_preds[i](reg_feat)
+                reg_feat = self.reg_convs[i](reg_x)
+                reg_output = self.reg_preds[i](reg_feat)
+                obj_output = self.obj_preds[i](reg_feat)
             
             output = torch.cat([reg_output, obj_output, cls_output], 1)
             outputs.append(output)
