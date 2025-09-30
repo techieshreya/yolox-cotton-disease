@@ -1,2 +1,7 @@
 venv/*
 
+.venv/*
+
+checkpoints/
+
+__pycache__/
