@@ -41,6 +41,7 @@ dependencies = [
     "tqdm==4.67.1",
     "typing-inspection==0.4.1",
     "typing-extensions==4.12.2",
+    "psutil>=7.1.0",
 ]
 
 [[tool.uv.index]]
