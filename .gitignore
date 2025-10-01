@@ -5,3 +5,5 @@ venv/*
 checkpoints/
 
 __pycache__/
+
+.env

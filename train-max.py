@@ -1,3 +1,6 @@
+
+
+
 import os
 import torch
 import numpy as np
@@ -179,7 +182,7 @@ def cxcywh_to_xyxy(boxes):
     return torch.stack([x1, y1, x2, y2], dim=1)
 
 
-def postprocess(predictions, strides, num_classes, conf_thre=0.01, nms_thre=0.5):
+def postprocess(predictions, strides, num_classes, conf_thre=0.05, nms_thre=0.5):
     """Post-processes raw predictions from the model."""
     all_detections = []
     device = predictions[0].device
@@ -570,7 +573,11 @@ def train(args):
             val_time = time.time() - val_start
             per_class_aps /= max(len(final_detections), 1)
 
-            if epoch % 5 == 0:
+        # Visualization (outside no_grad for matplotlib)
+        mean_ap = np.mean(per_class_aps) if len(per_class_aps) > 0 else 0.0
+
+        if epoch % 5 == 0:
+            try:
                 first_image, first_gt = val_dataset[0]
                 visualize_predictions(
                     first_image,
@@ -579,8 +586,9 @@ def train(args):
                     epoch,
                     args.save_dir
                 )
-
-        mean_ap = np.mean(per_class_aps) if len(per_class_aps) > 0 else 0.0
+                print(f'📊 Visualization saved: predictions_epoch_{epoch}.png')
+            except Exception as e:
+                print(f'⚠️  Could not save visualization: {e}')
         avg_val_loss = val_loss / len(val_loader)
         epoch_time = time.time() - epoch_start
 
@@ -631,6 +639,7 @@ def train(args):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'map': mean_ap,
             }, os.path.join(args.save_dir, f'epoch_{epoch+1}.pth'))
+            print(f'💾 Checkpoint saved: epoch_{epoch+1}.pth')
 
         # Clear CUDA cache periodically
         if torch.cuda.is_available() and (epoch + 1) % 10 == 0:
