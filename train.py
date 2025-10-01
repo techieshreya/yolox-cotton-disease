@@ -254,12 +254,12 @@ def train(args):
 
     # ---------- FIX 1: Corrected Dataset Initialization ----------
     train_dataset = CottonDiseaseDataset(
-        data_dir=r"D:\Genai\data\train",
+        data_dir=r"data/train",
         augmentations=train_augmentations,
         input_size=args.input_size,
     )
     val_dataset = CottonDiseaseDataset(
-        data_dir=r"D:\Genai\data\valid",
+        data_dir=r"data/valid",
         augmentations=val_augmentations,
         input_size=args.input_size,
     )
