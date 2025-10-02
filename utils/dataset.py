@@ -165,7 +165,15 @@ def mosaic_augmentation(dataset_obj, index, input_size):
                     all_boxes.append([new_x1, new_y1, new_x2, new_y2])
                     all_labels.append(cls)
 
-    return mosaic_img, np.array(all_boxes), np.array(all_labels)
+    # Ensure consistent array shapes
+    if len(all_boxes) > 0:
+        boxes_array = np.array(all_boxes, dtype=np.float32)
+        labels_array = np.array(all_labels, dtype=np.float32)
+    else:
+        boxes_array = np.zeros((0, 4), dtype=np.float32)
+        labels_array = np.zeros(0, dtype=np.float32)
+
+    return mosaic_img, boxes_array, labels_array
 
 
 # -------------------------------------------------------------------
@@ -191,10 +199,10 @@ def mixup_augmentation(img1, boxes1, labels1, img2, boxes2, labels2, alpha=0.5):
     # Random mixing ratio
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 0.5
 
-    # Mix images
+    # Blend images
     mixed_img = (lam * img1 + (1 - lam) * img2).astype(np.uint8)
 
-    # Combine boxes and labels
+    # Combine boxes and labels - ensure proper shapes
     if len(boxes1) > 0 and len(boxes2) > 0:
         mixed_boxes = np.vstack([boxes1, boxes2])
         mixed_labels = np.concatenate([labels1, labels2])
@@ -205,8 +213,8 @@ def mixup_augmentation(img1, boxes1, labels1, img2, boxes2, labels2, alpha=0.5):
         mixed_boxes = boxes2
         mixed_labels = labels2
     else:
-        mixed_boxes = np.array([])
-        mixed_labels = np.array([])
+        mixed_boxes = np.zeros((0, 4), dtype=np.float32)
+        mixed_labels = np.zeros(0, dtype=np.float32)
 
     return mixed_img, mixed_boxes, mixed_labels
 
@@ -288,6 +296,11 @@ class CottonDiseaseDataset(Dataset):
                 bboxes = bboxes[valid_mask]
                 class_labels = class_labels[valid_mask]
 
+                # Ensure we still have matching lengths after filtering
+                assert len(bboxes) == len(class_labels), (
+                    f"Mismatch after filtering: {len(bboxes)} boxes vs {len(class_labels)} labels"
+                )
+
             # Convert to list for Albumentations
             if len(bboxes) > 0:
                 bboxes = bboxes.tolist()
@@ -295,6 +308,11 @@ class CottonDiseaseDataset(Dataset):
             else:
                 bboxes = []
                 class_labels = []
+
+            # Final validation before augmentation
+            assert len(bboxes) == len(class_labels), (
+                f"Length mismatch before augmentation: {len(bboxes)} boxes vs {len(class_labels)} labels"
+            )
 
             # Use minimal augmentation pipeline for mosaic (no resize needed)
             mosaic_augs = get_mosaic_augs(self.input_size)
