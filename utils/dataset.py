@@ -40,7 +40,7 @@ def get_train_augs(input_size):
         ],
         # This part is key: it tells Albumentations how to handle bounding boxes.
         bbox_params=A.BboxParams(
-            format="pascal_voc",  # [x_min, y_min, x_max, y_max]
+            format="albumentations",  # [x_min, y_min, x_max, y_max] in normalized coordinates [0, 1]
             label_fields=["class_labels"],
             min_visibility=0.1,  # A box is kept if at least 10% of it is visible after augmentation
         ),
@@ -57,7 +57,9 @@ def get_val_augs(input_size):
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
-        bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"]),
+        bbox_params=A.BboxParams(
+            format="albumentations", label_fields=["class_labels"]
+        ),
     )
 
 
@@ -70,7 +72,9 @@ def get_mosaic_augs(input_size):
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
         ],
-        bbox_params=A.BboxParams(format="pascal_voc", label_fields=["class_labels"]),
+        bbox_params=A.BboxParams(
+            format="albumentations", label_fields=["class_labels"]
+        ),
     )
 
 
@@ -90,7 +94,7 @@ def mosaic_augmentation(dataset_obj, index, input_size):
 
     Returns:
         mosaic_image: Combined image
-        mosaic_boxes: Combined bounding boxes
+        mosaic_boxes: Combined bounding boxes (normalized [0,1])
         mosaic_labels: Combined class labels
     """
     h, w = input_size
@@ -154,15 +158,27 @@ def mosaic_augmentation(dataset_obj, index, input_size):
                 new_x2 = x1a + (x2 - x1b) * scale_x
                 new_y2 = y1a + (y2 - y1b) * scale_y
 
-                # Strict clipping to ensure boxes are within image bounds
-                new_x1 = max(0, min(new_x1, w - 2))
-                new_y1 = max(0, min(new_y1, h - 2))
-                new_x2 = max(new_x1 + 2, min(new_x2, w))
-                new_y2 = max(new_y1 + 2, min(new_y2, h))
+                # Clip to mosaic image bounds
+                new_x1 = max(0, min(new_x1, w - 1))
+                new_y1 = max(0, min(new_y1, h - 1))
+                new_x2 = max(new_x1 + 1, min(new_x2, w))
+                new_y2 = max(new_y1 + 1, min(new_y2, h))
 
                 # Only keep valid boxes with minimum size
                 if new_x2 > new_x1 + 1 and new_y2 > new_y1 + 1:
-                    all_boxes.append([new_x1, new_y1, new_x2, new_y2])
+                    # Normalize to [0, 1] range
+                    norm_x1 = new_x1 / w
+                    norm_y1 = new_y1 / h
+                    norm_x2 = new_x2 / w
+                    norm_y2 = new_y2 / h
+
+                    # Apply strict clipping to prevent floating point precision errors
+                    norm_x1 = max(0.0, min(norm_x1, 1.0))
+                    norm_y1 = max(0.0, min(norm_y1, 1.0))
+                    norm_x2 = max(0.0, min(norm_x2, 1.0))
+                    norm_y2 = max(0.0, min(norm_y2, 1.0))
+
+                    all_boxes.append([norm_x1, norm_y1, norm_x2, norm_y2])
                     all_labels.append(cls)
 
     # Ensure consistent array shapes
@@ -279,19 +295,22 @@ class CottonDiseaseDataset(Dataset):
                     image, bboxes, class_labels, img2, boxes2, labels2
                 )
 
-            # Strict clipping and validation of bounding boxes
+            # Normalize bboxes to [0, 1] range and apply strict clipping
             h, w = self.input_size
             if len(bboxes) > 0:
-                # Ensure all coordinates are within strict bounds (with epsilon margin)
-                eps = 1e-3
-                bboxes[:, 0] = np.clip(bboxes[:, 0], 0, w - 1)
-                bboxes[:, 1] = np.clip(bboxes[:, 1], 0, h - 1)
-                bboxes[:, 2] = np.clip(bboxes[:, 2], 1, w - eps)
-                bboxes[:, 3] = np.clip(bboxes[:, 3], 1, h - eps)
+                # Normalize to [0, 1] range
+                bboxes[:, 0] /= w  # x1
+                bboxes[:, 1] /= h  # y1
+                bboxes[:, 2] /= w  # x2
+                bboxes[:, 3] /= h  # y2
 
-                # Filter out invalid boxes
-                valid_mask = (bboxes[:, 2] > bboxes[:, 0] + 1) & (
-                    bboxes[:, 3] > bboxes[:, 1] + 1
+                # Apply strict clipping to prevent floating point precision errors
+                bboxes = np.clip(bboxes, 0.0, 1.0)
+
+                # Filter out invalid boxes (ensure minimum size in normalized space)
+                min_size = 1.0 / max(w, h)  # At least 1 pixel in normalized coordinates
+                valid_mask = (bboxes[:, 2] > bboxes[:, 0] + min_size) & (
+                    bboxes[:, 3] > bboxes[:, 1] + min_size
                 )
                 bboxes = bboxes[valid_mask]
                 class_labels = class_labels[valid_mask]
@@ -358,14 +377,24 @@ class CottonDiseaseDataset(Dataset):
             targets_np = np.array(targets_list, dtype=np.float32)
 
             # Clip the bounding box coordinates to be within the image dimensions.
-            targets_np[:, 0] = np.clip(targets_np[:, 0], 0, orig_w)  # x1
-            targets_np[:, 1] = np.clip(targets_np[:, 1], 0, orig_h)  # y1
-            targets_np[:, 2] = np.clip(targets_np[:, 2], 0, orig_w)  # x2
-            targets_np[:, 3] = np.clip(targets_np[:, 3], 0, orig_h)  # y2
+            targets_np[:, 0] = np.clip(targets_np[:, 0], 0, orig_w - 1)  # x1
+            targets_np[:, 1] = np.clip(targets_np[:, 1], 0, orig_h - 1)  # y1
+            targets_np[:, 2] = np.clip(targets_np[:, 2], 1, orig_w)  # x2
+            targets_np[:, 3] = np.clip(targets_np[:, 3], 1, orig_h)  # y2
 
         # Separate bboxes and class labels for Albumentations
         bboxes = targets_np[:, :4]
         class_labels = targets_np[:, 4]
+
+        # Normalize bboxes to [0, 1] range for Albumentations
+        if len(bboxes) > 0:
+            bboxes[:, 0] /= orig_w  # x1
+            bboxes[:, 1] /= orig_h  # y1
+            bboxes[:, 2] /= orig_w  # x2
+            bboxes[:, 3] /= orig_h  # y2
+
+            # Apply strict clipping to prevent floating point precision errors
+            bboxes = np.clip(bboxes, 0.0, 1.0)
 
         # Apply Mixup augmentation with probability (without Mosaic)
         if self.use_mixup and random.random() < self.mixup_prob:
@@ -383,8 +412,21 @@ class CottonDiseaseDataset(Dataset):
             targets_list2 = self._parse_xml(xml_path2)
             if targets_list2:
                 targets_np2 = np.array(targets_list2, dtype=np.float32)
+                # Clip coordinates for second image
+                targets_np2[:, 0] = np.clip(targets_np2[:, 0], 0, orig_w - 1)  # x1
+                targets_np2[:, 1] = np.clip(targets_np2[:, 1], 0, orig_h - 1)  # y1
+                targets_np2[:, 2] = np.clip(targets_np2[:, 2], 1, orig_w)  # x2
+                targets_np2[:, 3] = np.clip(targets_np2[:, 3], 1, orig_h)  # y2
+
                 boxes2 = targets_np2[:, :4]
                 labels2 = targets_np2[:, 4]
+
+                # Normalize boxes2 to [0, 1] range
+                boxes2[:, 0] /= orig_w  # x1
+                boxes2[:, 1] /= orig_h  # y1
+                boxes2[:, 2] /= orig_w  # x2
+                boxes2[:, 3] /= orig_h  # y2
+                boxes2 = np.clip(boxes2, 0.0, 1.0)
             else:
                 boxes2 = np.array([])
                 labels2 = np.array([])
@@ -395,12 +437,28 @@ class CottonDiseaseDataset(Dataset):
 
         # Apply augmentations
         if self.augmentations:
+            # Convert to list format for Albumentations
+            if len(bboxes) > 0:
+                bbox_list = bboxes.tolist()
+                label_list = class_labels.tolist()
+            else:
+                bbox_list = []
+                label_list = []
+
             augmented = self.augmentations(
-                image=image, bboxes=bboxes, class_labels=class_labels
+                image=image, bboxes=bbox_list, class_labels=label_list
             )
             image = augmented["image"]
-            bboxes = augmented["bboxes"]
-            class_labels = augmented["class_labels"]
+            bboxes = (
+                np.array(augmented["bboxes"])
+                if augmented["bboxes"]
+                else np.zeros((0, 4))
+            )
+            class_labels = (
+                np.array(augmented["class_labels"])
+                if augmented["class_labels"]
+                else np.zeros(0)
+            )
 
         # Re-assemble the targets tensor
         if len(bboxes) > 0:
