@@ -141,11 +141,17 @@ def mosaic_augmentation(dataset_obj, index, input_size):
                 new_x2 = x1a + (x2 - x1b) * scale_x
                 new_y2 = y1a + (y2 - y1b) * scale_y
 
-                # Clip to mosaic boundaries
-                new_x1 = np.clip(new_x1, 0, w)
-                new_y1 = np.clip(new_y1, 0, h)
-                new_x2 = np.clip(new_x2, 0, w)
-                new_y2 = np.clip(new_y2, 0, h)
+                # Clip to mosaic boundaries (strict clipping to avoid boundary issues)
+                new_x1 = np.clip(new_x1, 0, w - 1)
+                new_y1 = np.clip(new_y1, 0, h - 1)
+                new_x2 = np.clip(new_x2, 1, w)
+                new_y2 = np.clip(new_y2, 1, h)
+
+                # Ensure x2 > x1 and y2 > y1 after clipping
+                if new_x2 <= new_x1:
+                    new_x2 = min(new_x1 + 2, w)
+                if new_y2 <= new_y1:
+                    new_y2 = min(new_y1 + 2, h)
 
                 # Only keep valid boxes
                 if new_x2 > new_x1 + 1 and new_y2 > new_y1 + 1:
@@ -260,6 +266,13 @@ class CottonDiseaseDataset(Dataset):
 
             # Convert to appropriate format for Albumentations
             if len(bboxes) > 0:
+                # Strict clipping to ensure all boxes are within valid bounds
+                h, w = self.input_size
+                bboxes[:, 0] = np.clip(bboxes[:, 0], 0, w - 1)
+                bboxes[:, 1] = np.clip(bboxes[:, 1], 0, h - 1)
+                bboxes[:, 2] = np.clip(bboxes[:, 2], 1, w)
+                bboxes[:, 3] = np.clip(bboxes[:, 3], 1, h)
+
                 bboxes = bboxes.tolist()
                 class_labels = class_labels.tolist()
             else:
