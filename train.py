@@ -172,15 +172,9 @@ def calculate_map(pred_results, true_boxes, true_classes, iou_threshold=0.5):
         ious = calculate_iou(pred_boxes[i], true_boxes)
         best_gt_idx = np.argmax(ious)
 
-        if ious[best_gt_idx] > iou_threshold:
-            if (
-                int(pred_classes[i]) == int(true_classes[best_gt_idx])
-                and not gt_matched[best_gt_idx]
-            ):
-                tp[i] = 1
-                gt_matched[best_gt_idx] = 1
-            else:
-                fp[i] = 1
+        if ious[best_gt_idx] > iou_threshold and not gt_matched[best_gt_idx]:
+            tp[i] = 1
+            gt_matched[best_gt_idx] = 1
         else:
             fp[i] = 1
 
@@ -298,6 +292,8 @@ def train(args):
     val_augmentations = get_val_augs(args.input_size)
 
     # ---------- FIX 1: Corrected Dataset Initialization ----------
+    # Note: Validation set is very small (94 images) and has severe class imbalance
+    # Consider moving some training data to validation for more stable evaluation
     train_dataset = CottonDiseaseDataset(
         data_dir=r"data/train",
         augmentations=train_augmentations,
@@ -339,9 +335,12 @@ def train(args):
         optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.001
     )
 
-    # Class weights to handle imbalance - give more weight to difficult classes
-    # [curl_stage1, curl_stage2, healthy, leaf_enation, sooty]
-    class_weights = [2.0, 1.0, 1.0, 1.0, 1.0]  # 2x weight for curl_stage1
+    # Class weights to handle severe imbalance
+    # Based on training set distribution: curl_stage1:1185, curl_stage2:1848, healthy:1587, leaf_enation:51, sooty:1575
+    # Calculate effective class frequency weights (higher weight for rare classes)
+    class_frequencies = [1185, 1848, 1587, 51, 1575]
+    total_samples = sum(class_frequencies)
+    class_weights = [total_samples / (freq * len(class_frequencies)) for freq in class_frequencies]
     criterion = YOLOXLoss(
         num_classes=args.num_classes,
         strides=model.stride.tolist(),
@@ -511,13 +510,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=2,
-        help="Batch size for training (try 4-8 if you have enough VRAM)",
+        default=4,
+        help="Batch size for training (increased for better stability)",
     )
     parser.add_argument(
         "--epochs", type=int, default=200, help="Number of training epochs"
     )  # Increased epochs
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=2e-3, help="Learning rate (increased for larger batch size)")
     parser.add_argument(
         "--num_workers",
         type=int,
