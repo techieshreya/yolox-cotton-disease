@@ -10,11 +10,41 @@ import matplotlib.patches as patches
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
+import logging
+import datetime
 
 # Local imports
 from utils.dataset import CottonDiseaseDataset, get_train_augs, get_val_augs
 from utils.loss import YOLOXLoss
 from models.yolox import YOLOX
+
+
+def generate_run_id():
+    """Generate a unique run ID based on current timestamp"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"run_{timestamp}"
+
+
+def setup_logging(save_dir):
+    """Setup logging to both console and file"""
+    # Create logs directory
+    logs_dir = os.path.join(save_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Create log file path
+    log_file = os.path.join(logs_dir, "training.log")
+
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()  # Also log to console
+        ]
+    )
+
+    return logging.getLogger(__name__)
 
 
 def collate_fn(batch):
@@ -239,14 +269,29 @@ def visualize_predictions(image, pred_boxes, gt_boxes, epoch, save_dir):
 
     plt.title(f"Epoch {epoch} Predictions (Red) vs Ground Truth (Green)")
     plt.axis("off")
-    os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, f"predictions_epoch_{epoch}.png"))
+    # Create visualizations directory within run directory
+    vis_dir = os.path.join(save_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    plt.savefig(os.path.join(vis_dir, f"predictions_epoch_{epoch}.png"))
     plt.close()
 
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+
+    # Generate unique run ID
+    run_id = generate_run_id()
+
+    # Create run-specific save directory
+    run_save_dir = os.path.join(args.save_dir, run_id)
+    os.makedirs(run_save_dir, exist_ok=True)
+
+    # Setup logging
+    logger = setup_logging(run_save_dir)
+
+    logger.info(f"Starting training run: {run_id}")
+    logger.info(f"Using device: {device}")
+    logger.info(f"Arguments: {args}")
 
     # Create the augmentation pipelines
     train_augmentations = get_train_augs(args.input_size)
@@ -392,7 +437,7 @@ def train(args):
                     final_detections[0].cpu().numpy(),
                     first_gt[:, :4].cpu().numpy(),
                     epoch,
-                    args.save_dir,
+                    run_save_dir,
                 )
 
         mean_ap = np.mean(per_class_aps) if len(per_class_aps) > 0 else 0.0
@@ -401,11 +446,11 @@ def train(args):
         if epoch >= warmup_epochs:
             main_scheduler.step()
 
-        # Print with color coding for problematic classes
+        # Log with color coding for problematic classes
         curl1_indicator = (
             "🔴" if per_class_aps[0] < 0.5 else "🟡" if per_class_aps[0] < 0.8 else "🟢"
         )
-        print(
+        logger.info(
             f"Epoch {epoch + 1}/{args.epochs} | "
             f"Train Loss: {train_loss / len(train_loader):.4f} | "
             f"Val Loss: {val_loss / len(val_loader):.4f} | "
@@ -422,12 +467,12 @@ def train(args):
         if mean_ap > best_map:
             best_map = mean_ap
             torch.save(
-                model.state_dict(), os.path.join(args.save_dir, "best_model.pth")
+                model.state_dict(), os.path.join(run_save_dir, "best_model.pth")
             )
-            print(f"New best model saved with mAP: {best_map:.4f}")
+            logger.info(f"New best model saved with mAP: {best_map:.4f}")
 
         if (epoch + 1) % args.save_interval == 0:
-            os.makedirs(args.save_dir, exist_ok=True)
+            os.makedirs(run_save_dir, exist_ok=True)
             torch.save(
                 {
                     "epoch": epoch + 1,
@@ -435,8 +480,11 @@ def train(args):
                     "optimizer_state_dict": optimizer.state_dict(),
                     "map": mean_ap,
                 },
-                os.path.join(args.save_dir, f"epoch_{epoch + 1}.pth"),
+                os.path.join(run_save_dir, f"epoch_{epoch + 1}.pth"),
             )
+
+    logger.info(f"Training completed for run: {run_id}")
+    logger.info(f"All checkpoints and logs saved in: {run_save_dir}")
 
 
 if __name__ == "__main__":
@@ -487,4 +535,10 @@ if __name__ == "__main__":
         args = parser.parse_args([])
 
     os.makedirs(args.save_dir, exist_ok=True)
-    train(args)
+
+    try:
+        train(args)
+        print("Training completed successfully!")
+    except Exception as e:
+        print(f"Training failed with error: {e}")
+        raise
