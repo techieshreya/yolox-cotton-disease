@@ -69,7 +69,7 @@ def cxcywh_to_xyxy(boxes):
     return torch.stack([x1, y1, x2, y2], dim=1)
 
 
-def postprocess(predictions, strides, num_classes, conf_thre=0.01, nms_thre=0.5):
+def postprocess(predictions, strides, num_classes, conf_thre=0.25, nms_thre=0.5):
     """
     Post-processes raw predictions from the model.
     'predictions': A list of 3 tensors, one for each FPN level.
@@ -336,12 +336,12 @@ def train(args):
     warmup_epochs = 5
     lr_warmup_factor = 1.0 / warmup_epochs
     main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.01
+        optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.001
     )
 
     # Class weights to handle imbalance - give more weight to difficult classes
     # [curl_stage1, curl_stage2, healthy, leaf_enation, sooty]
-    class_weights = [3.0, 1.0, 1.0, 1.0, 1.0]  # 3x weight for curl_stage1
+    class_weights = [2.0, 1.0, 1.0, 1.0, 1.0]  # 2x weight for curl_stage1
     criterion = YOLOXLoss(
         num_classes=args.num_classes,
         strides=model.stride.tolist(),
@@ -381,6 +381,7 @@ def train(args):
         # The new model's output is a list of tensors, one for each FPN level
         # We need a new way to store predictions for post-processing
         output_predictions = []
+        gt_targets_list = []  # Store ground truth for each image
 
         start_time = time.time()
         with torch.no_grad():
@@ -399,35 +400,40 @@ def train(args):
                 if batch_idx == 0:
                     for level_out in outputs:
                         output_predictions.append(level_out)
+                    gt_targets_list.extend(targets_xyxy)
                 else:
                     for i, level_out in enumerate(outputs):
                         output_predictions[i] = torch.cat(
                             (output_predictions[i], level_out), dim=0
                         )
+                    gt_targets_list.extend(targets_xyxy)
 
             # Perform post-processing on all validation data at once
             final_detections = postprocess(
-                output_predictions, model.stride.to(device), args.num_classes
+                output_predictions, model.stride.to(device), args.num_classes, conf_thre=0.25
             )
 
             per_class_aps = np.zeros(args.num_classes)
             for i in range(len(final_detections)):
                 pred_results_np = final_detections[i].cpu().numpy()
-                # We need to get the correct ground truth for each image
-                # This assumes val_loader batch size is consistent, which is typical
-                gt_idx = i
-                gt_target = val_dataset[gt_idx][1].numpy()
 
-                if gt_target.shape[0] > 0:
-                    gt_boxes = gt_target[:, :4]
-                    gt_classes = gt_target[:, 4]
-                    aps = calculate_map_per_class(
-                        pred_results_np, gt_boxes, gt_classes, args.num_classes
-                    )
-                    per_class_aps += np.array(aps)
+                # Get the correct ground truth for this image
+                if i < len(gt_targets_list):
+                    gt_target = gt_targets_list[i].cpu().numpy()
+
+                    if gt_target.shape[0] > 0:
+                        gt_boxes = gt_target[:, :4]
+                        gt_classes = gt_target[:, 4]
+                        aps = calculate_map_per_class(
+                            pred_results_np, gt_boxes, gt_classes, args.num_classes
+                        )
+                        per_class_aps += np.array(aps)
 
             inference_time = time.time() - start_time
-            per_class_aps /= len(final_detections)
+            # Only average over images that have ground truth annotations
+            num_gt_images = sum(1 for gt in gt_targets_list if gt.shape[0] > 0)
+            if num_gt_images > 0:
+                per_class_aps /= num_gt_images
 
             if epoch % 5 == 0:  # Visualize every 5 epochs
                 # Get the first image of the validation set for visualization
@@ -506,7 +512,7 @@ if __name__ == "__main__":
         "--batch_size",
         type=int,
         default=2,
-        help="Batch size for training (reduced for YOLOX-M)",
+        help="Batch size for training (try 4-8 if you have enough VRAM)",
     )
     parser.add_argument(
         "--epochs", type=int, default=200, help="Number of training epochs"

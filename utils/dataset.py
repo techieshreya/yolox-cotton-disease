@@ -149,5 +149,11 @@ class CottonDiseaseDataset(Dataset):
         return targets
     
     def _class_name_to_id(self, class_name):
-        class_map = {'healthy': 0, 'diseased': 1}
-        return class_map.get(class_name, 0)
+        class_map = {
+            'curl_stage1': 0,
+            'curl_stage2': 1,
+            'healthy': 2,
+            'leaf_enation': 3,
+            'sooty': 4
+        }
+        return class_map.get(class_name, 2)  # Default to healthy if unknown
