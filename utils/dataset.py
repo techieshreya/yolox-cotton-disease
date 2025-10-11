@@ -149,11 +149,30 @@ class CottonDiseaseDataset(Dataset):
         return targets
     
     def _class_name_to_id(self, class_name):
+        """
+        Map class names to IDs for disease + severity detection.
+        Based on the paper: "Handling Severity Levels of Multiple Co-Occurring Cotton Plant Diseases Using Improved YOLOX Model"
+        """
         class_map = {
-            'curl_stage1': 0,
-            'curl_stage2': 1,
-            'healthy': 2,
-            'leaf_enation': 3,
-            'sooty': 4
+            # Disease types with severity levels
+            'curl_stage1': 0,    # Cotton leaf curl disease - Stage 1 (mild)
+            'curl_stage2': 1,    # Cotton leaf curl disease - Stage 2 (severe)
+            'healthy': 2,        # Healthy cotton plant
+            'leaf_enation': 3,   # Leaf enation disease
+            'sooty': 4          # Sooty mold disease
         }
         return class_map.get(class_name, 2)  # Default to healthy if unknown
+    
+    def get_class_info(self, class_id):
+        """
+        Get disease and severity information for a class ID.
+        Returns: (disease_type, severity_level)
+        """
+        class_info = {
+            0: ('curl', 'stage1'),
+            1: ('curl', 'stage2'), 
+            2: ('healthy', 'none'),
+            3: ('leaf_enation', 'moderate'),
+            4: ('sooty', 'severe')
+        }
+        return class_info.get(class_id, ('unknown', 'unknown'))

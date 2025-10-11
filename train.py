@@ -326,13 +326,25 @@ def train(args):
     # Model, Optimizer, Loss
     model = YOLOX(num_classes=args.num_classes, phi=args.phi).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
+    # Improved optimizer with tuned parameters for cotton disease detection
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.lr, 
+        weight_decay=1e-4,  # Reduced weight decay for better convergence
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
 
-    # Add a learning rate warmup scheduler
-    warmup_epochs = 5
+    # Enhanced learning rate scheduling with warmup and cosine annealing
+    warmup_epochs = 10  # Increased warmup for better stability
     lr_warmup_factor = 1.0 / warmup_epochs
-    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.001
+    
+    # Cosine annealing with restarts for better convergence
+    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=20,  # Restart every 20 epochs
+        T_mult=2,  # Double the restart period each time
+        eta_min=args.lr * 0.01  # Minimum learning rate
     )
 
     # Class weights to handle severe imbalance
@@ -346,9 +358,14 @@ def train(args):
         strides=model.stride.tolist(),
         use_focal_loss=True,  # Enable focal loss for hard examples
         class_weights=class_weights,
+        alpha_iou=args.alpha_iou,  # Use α-IoU loss
     )
 
+    # Early stopping parameters
     best_map = 0.0
+    patience = 30  # Stop if no improvement for 30 epochs
+    patience_counter = 0
+    min_delta = 0.001  # Minimum improvement threshold
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
@@ -469,12 +486,23 @@ def train(args):
             f"LR: {optimizer.param_groups[0]['lr']:.2e}"
         )
 
-        if mean_ap > best_map:
+        # Early stopping logic
+        if mean_ap > best_map + min_delta:
             best_map = mean_ap
+            patience_counter = 0
             torch.save(
                 model.state_dict(), os.path.join(run_save_dir, "best_model.pth")
             )
             logger.info(f"New best model saved with mAP: {best_map:.4f}")
+        else:
+            patience_counter += 1
+            logger.info(f"No improvement for {patience_counter} epochs (patience: {patience})")
+            
+            # Early stopping
+            if patience_counter >= patience:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                logger.info(f"Best mAP achieved: {best_map:.4f}")
+                break
 
         if (epoch + 1) % args.save_interval == 0:
             os.makedirs(run_save_dir, exist_ok=True)
@@ -514,13 +542,14 @@ if __name__ == "__main__":
         help="Batch size for training (increased for better stability)",
     )
     parser.add_argument(
-        "--epochs", type=int, default=200, help="Number of training epochs"
+        "--epochs", type=int, default=100, help="Number of training epochs"
     )  # Increased epochs
-    parser.add_argument("--lr", type=float, default=2e-3, help="Learning rate (increased for larger batch size)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (tuned for cotton disease detection)")
+    parser.add_argument("--alpha_iou", type=float, default=2.0, help="Alpha parameter for α-IoU loss")
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=47,
+        default=0,
         help="Number of workers for data loading (0 for Windows is often safest)",
     )
     parser.add_argument(

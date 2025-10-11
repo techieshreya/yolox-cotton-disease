@@ -14,15 +14,22 @@ VAL_ANN = os.path.join(DATA_DIR, "valid.json")
 TEST_ANN = os.path.join(DATA_DIR, "test.json")
 
 # === Model ===
-NUM_CLASSES = 5  # curl_stage1, curl_stage2, healthy, leaf_enation, sooty
-MODEL_NAME = "improved_yolox_m"  # Options: improved_yolox_s, improved_yolox_m, improved_yolox_l, improved_yolox_x
+NUM_CLASSES = 5  # curl_stage1, curl_stage2, healthy, leaf_enation, sooty (includes disease + severity)
+MODEL_NAME = "improved_yolox_s"  # Using YOLOX-s as base model with improvements
+DISEASE_CLASSES = ['curl_stage1', 'curl_stage2', 'healthy', 'leaf_enation', 'sooty']
+SEVERITY_LEVELS = ['stage1', 'stage2', 'healthy', 'moderate', 'severe']  # Severity mapping
 
 # === Training Hyperparameters ===
-BATCH_SIZE = 4  # Reduced for larger YOLOX-M model (uses ~3x more memory than YOLOX-S)
-NUM_EPOCHS = 200  # Increased for better convergence
-LEARNING_RATE = 0.001
-WEIGHT_DECAY = 0.0005
-ALPHA_IOU = 2.0  # For alpha-IoU loss
+BATCH_SIZE = 4  # Optimized for YOLOX-s with improved architecture
+NUM_EPOCHS = 200  # Maximum epochs (early stopping will prevent overfitting)
+LEARNING_RATE = 0.001  # Tuned learning rate for cotton disease detection
+WEIGHT_DECAY = 0.0001  # Reduced weight decay for better convergence
+ALPHA_IOU = 2.0  # α-IoU loss parameter (paper recommendation)
+
+# === Early Stopping Parameters ===
+EARLY_STOPPING_PATIENCE = 30  # Stop if no improvement for 30 epochs
+MIN_DELTA = 0.001  # Minimum improvement threshold
+WARMUP_EPOCHS = 10  # Learning rate warmup epochs
 
 # === Augmentations ===
 AUGMENTATIONS = {

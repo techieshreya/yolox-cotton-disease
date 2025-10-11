@@ -62,6 +62,111 @@ def giou_loss(pred_boxes_xyxy, gt_boxes_xyxy, reduction="none"):
         return loss
 
 
+def alpha_iou_loss(pred_boxes_xyxy, gt_boxes_xyxy, alpha=2.0, reduction="none"):
+    """
+    Calculate α-IoU loss for improved convergence.
+    Based on the paper: "α-IoU: A Family of Power Intersection over Union Losses for Accurate Object Detection"
+    
+    Args:
+        pred_boxes_xyxy (Tensor): Predicted boxes, shape (N, 4), format (x1, y1, x2, y2)
+        gt_boxes_xyxy (Tensor): Ground truth boxes, shape (N, 4), format (x1, y1, x2, y2)
+        alpha (float): Power parameter for α-IoU (typically 2.0-3.0)
+        reduction (str): Reduction method
+    Returns:
+        Tensor: α-IoU loss
+    """
+    # Intersection
+    inter_x1 = torch.max(pred_boxes_xyxy[:, 0], gt_boxes_xyxy[:, 0])
+    inter_y1 = torch.max(pred_boxes_xyxy[:, 1], gt_boxes_xyxy[:, 1])
+    inter_x2 = torch.min(pred_boxes_xyxy[:, 2], gt_boxes_xyxy[:, 2])
+    inter_y2 = torch.min(pred_boxes_xyxy[:, 3], gt_boxes_xyxy[:, 3])
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(
+        inter_y2 - inter_y1, min=0
+    )
+
+    # Union
+    pred_area = (pred_boxes_xyxy[:, 2] - pred_boxes_xyxy[:, 0]) * (
+        pred_boxes_xyxy[:, 3] - pred_boxes_xyxy[:, 1]
+    )
+    gt_area = (gt_boxes_xyxy[:, 2] - gt_boxes_xyxy[:, 0]) * (
+        gt_boxes_xyxy[:, 3] - gt_boxes_xyxy[:, 1]
+    )
+    union_area = pred_area + gt_area - inter_area
+
+    # IoU
+    iou = inter_area / (union_area + 1e-6)
+    
+    # α-IoU: Apply power transformation
+    alpha_iou = torch.pow(iou, alpha)
+    
+    # α-IoU loss
+    loss = 1.0 - alpha_iou
+
+    if reduction == "sum":
+        return loss.sum()
+    elif reduction == "mean":
+        return loss.mean()
+    else:  # "none"
+        return loss
+
+
+def alpha_giou_loss(pred_boxes_xyxy, gt_boxes_xyxy, alpha=2.0, reduction="none"):
+    """
+    Calculate α-GIoU loss combining α-IoU with GIoU for better performance.
+    
+    Args:
+        pred_boxes_xyxy (Tensor): Predicted boxes, shape (N, 4), format (x1, y1, x2, y2)
+        gt_boxes_xyxy (Tensor): Ground truth boxes, shape (N, 4), format (x1, y1, x2, y2)
+        alpha (float): Power parameter for α-IoU (typically 2.0-3.0)
+        reduction (str): Reduction method
+    Returns:
+        Tensor: α-GIoU loss
+    """
+    # Intersection
+    inter_x1 = torch.max(pred_boxes_xyxy[:, 0], gt_boxes_xyxy[:, 0])
+    inter_y1 = torch.max(pred_boxes_xyxy[:, 1], gt_boxes_xyxy[:, 1])
+    inter_x2 = torch.min(pred_boxes_xyxy[:, 2], gt_boxes_xyxy[:, 2])
+    inter_y2 = torch.min(pred_boxes_xyxy[:, 3], gt_boxes_xyxy[:, 3])
+    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(
+        inter_y2 - inter_y1, min=0
+    )
+
+    # Union
+    pred_area = (pred_boxes_xyxy[:, 2] - pred_boxes_xyxy[:, 0]) * (
+        pred_boxes_xyxy[:, 3] - pred_boxes_xyxy[:, 1]
+    )
+    gt_area = (gt_boxes_xyxy[:, 2] - gt_boxes_xyxy[:, 0]) * (
+        gt_boxes_xyxy[:, 3] - gt_boxes_xyxy[:, 1]
+    )
+    union_area = pred_area + gt_area - inter_area
+
+    # IoU
+    iou = inter_area / (union_area + 1e-6)
+
+    # Bounding box of the union
+    c_x1 = torch.min(pred_boxes_xyxy[:, 0], gt_boxes_xyxy[:, 0])
+    c_y1 = torch.min(pred_boxes_xyxy[:, 1], gt_boxes_xyxy[:, 1])
+    c_x2 = torch.max(pred_boxes_xyxy[:, 2], gt_boxes_xyxy[:, 2])
+    c_y2 = torch.max(pred_boxes_xyxy[:, 3], gt_boxes_xyxy[:, 3])
+    c_area = (c_x2 - c_x1) * (c_y2 - c_y1)
+
+    # GIoU
+    giou = iou - (c_area - union_area) / (c_area + 1e-6)
+    
+    # α-GIoU: Apply power transformation
+    alpha_giou = torch.pow(giou, alpha)
+    
+    # α-GIoU loss
+    loss = 1.0 - alpha_giou
+
+    if reduction == "sum":
+        return loss.sum()
+    elif reduction == "mean":
+        return loss.mean()
+    else:  # "none"
+        return loss
+
+
 def focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction="none"):
     """
     Focal Loss for addressing class imbalance.
@@ -88,16 +193,17 @@ def focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction="none"):
 
 class YOLOXLoss(nn.Module):
     def __init__(
-        self, num_classes, strides=[8, 16, 32], use_focal_loss=True, class_weights=None
+        self, num_classes, strides=[8, 16, 32], use_focal_loss=True, class_weights=None, alpha_iou=2.0
     ):
         super().__init__()
         self.num_classes = num_classes
         self.strides = strides
         self.use_focal_loss = use_focal_loss
+        self.alpha_iou = alpha_iou
 
         self.bce_loss = nn.BCEWithLogitsLoss(reduction="none")
         self.focal_loss = focal_loss
-        self.iou_loss = giou_loss
+        self.iou_loss = alpha_giou_loss  # Use α-GIoU loss instead of GIoU
 
         # Class weights for handling imbalance (if provided)
         if class_weights is not None:
@@ -203,7 +309,7 @@ class YOLOXLoss(nn.Module):
             pred_xyxy = cxcywh_to_xyxy(pred_box_b[fg_mask])
             gt_xyxy = cxcywh_to_xyxy(gt_boxes_cxcywh)
 
-            loss_reg = self.iou_loss(pred_xyxy, gt_xyxy, reduction="sum")
+            loss_reg = self.iou_loss(pred_xyxy, gt_xyxy, alpha=self.alpha_iou, reduction="sum")
 
             # Use focal loss for classification if enabled
             if self.use_focal_loss:

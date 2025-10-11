@@ -278,6 +278,18 @@ class SimSPPF(nn.Module):
             return self.attn(out)
 
 
+class ImprovedSPPF(nn.Module):
+    """Improved SPPF with skip connections and enhanced multi-scale features"""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        from models.improved_ssp import ImprovedSPP
+        self.spp = ImprovedSPP(in_channels, out_channels)
+
+    def forward(self, x):
+        return self.spp(x)
+
+
 # YOLOX Architecture -------------------------------------------------------------
 
 
@@ -302,7 +314,7 @@ class CSPDarknet(nn.Module):
         )
         self.dark5 = nn.Sequential(
             BaseConv(base_channels * 8, base_channels * 16, 3, 2),
-            SimSPPF(base_channels * 16, base_channels * 16),
+            ImprovedSPPF(base_channels * 16, base_channels * 16),
             CSPLayer(
                 base_channels * 16, base_channels * 16, n=base_depth, shortcut=False
             ),
