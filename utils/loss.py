@@ -167,6 +167,77 @@ def alpha_giou_loss(pred_boxes_xyxy, gt_boxes_xyxy, alpha=2.0, reduction="none")
         return loss
 
 
+def severity_aware_loss(pred_severity, gt_severity, severity_weights=None, reduction="none"):
+    """
+    Severity-Aware Loss for handling disease severity levels.
+    
+    Args:
+        pred_severity (Tensor): Predicted severity logits, shape (N, num_severity_levels)
+        gt_severity (Tensor): Ground truth severity labels, shape (N,)
+        severity_weights (Tensor): Weights for different severity levels
+        reduction (str): Reduction method
+    Returns:
+        Tensor: Severity-aware loss
+    """
+    # Convert to one-hot encoding
+    gt_severity_onehot = F.one_hot(gt_severity.long(), num_classes=pred_severity.shape[1]).float()
+    
+    # Cross-entropy loss
+    ce_loss = F.cross_entropy(pred_severity, gt_severity.long(), reduction="none")
+    
+    # Apply severity weights if provided
+    if severity_weights is not None:
+        severity_weights = severity_weights.to(pred_severity.device)
+        weights = severity_weights[gt_severity.long()]
+        ce_loss = ce_loss * weights
+    
+    # Focal loss for severity (focus on hard examples)
+    pred_prob = F.softmax(pred_severity, dim=1)
+    p_t = torch.gather(pred_prob, 1, gt_severity.long().unsqueeze(1)).squeeze(1)
+    focal_weight = (1 - p_t) ** 2  # gamma=2
+    severity_loss = focal_weight * ce_loss
+
+    if reduction == "sum":
+        return severity_loss.sum()
+    elif reduction == "mean":
+        return severity_loss.mean()
+    else:  # "none"
+        return severity_loss
+
+
+def multi_task_loss(pred_detection, pred_severity, gt_boxes, gt_classes, gt_severity, 
+                   alpha_iou=2.0, severity_weights=None, reduction="none"):
+    """
+    Multi-task loss combining detection and severity prediction.
+    
+    Args:
+        pred_detection (Tensor): Detection predictions
+        pred_severity (Tensor): Severity predictions
+        gt_boxes (Tensor): Ground truth boxes
+        gt_classes (Tensor): Ground truth classes
+        gt_severity (Tensor): Ground truth severity levels
+        alpha_iou (float): α-IoU parameter
+        severity_weights (Tensor): Weights for severity levels
+        reduction (str): Reduction method
+    Returns:
+        dict: Dictionary containing different loss components
+    """
+    # Detection loss (α-IoU + Focal)
+    detection_loss = alpha_giou_loss(pred_detection, gt_boxes, alpha=alpha_iou, reduction=reduction)
+    
+    # Severity loss
+    severity_loss = severity_aware_loss(pred_severity, gt_severity, severity_weights, reduction=reduction)
+    
+    # Combined loss
+    total_loss = detection_loss + 0.5 * severity_loss
+    
+    return {
+        'total_loss': total_loss,
+        'detection_loss': detection_loss,
+        'severity_loss': severity_loss
+    }
+
+
 def focal_loss(pred, target, alpha=0.25, gamma=2.0, reduction="none"):
     """
     Focal Loss for addressing class imbalance.
