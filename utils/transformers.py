@@ -5,7 +5,7 @@ import config  # Import your config.py
 
 def get_train_transforms():
     transforms = [
-        A.Resize(640, 640),  # YOLOX input size (adjust if needed)
+        A.RandomResizedCrop(640, 640, scale=(0.8, 1.2), ratio=(0.9, 1.1), p=1.0),
         A.HorizontalFlip(p=config.AUGMENTATIONS['flip_prob']),
         A.RandomRotate90(p=config.AUGMENTATIONS['rotate_prob']),
         A.RandomBrightnessContrast(
@@ -13,6 +13,7 @@ def get_train_transforms():
             brightness_limit=config.AUGMENTATIONS['brightness_limit'],
             contrast_limit=config.AUGMENTATIONS['contrast_limit'],
         ),
+        A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=10, val_shift_limit=10, p=0.3),
         ToTensorV2(p=1.0),  # Convert to PyTorch tensor
     ]
     return A.Compose(transforms, bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))

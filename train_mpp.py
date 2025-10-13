@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
+from torch.utils.data.sampler import WeightedRandomSampler
 from tqdm import tqdm
 import argparse
 import matplotlib.pyplot as plt
@@ -72,11 +73,19 @@ def train(args):
         input_size=args.input_size,
     )
     
-    # DataLoaders
+    # DataLoaders with class-balanced sampling
+    sampler = None
+    if getattr(args, 'balanced_sampling', True):
+        # Normalize weights
+        weights = np.array(train_dataset.sample_weights, dtype=np.float64)
+        weights = weights / weights.sum()
+        sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
@@ -102,6 +111,10 @@ def train(args):
         eps=1e-8
     )
     
+    # Multi-scale training: change input size every N iterations
+    multiscale = getattr(args, 'multiscale', True)
+    ms_min, ms_max = getattr(args, 'ms_min', 480), getattr(args, 'ms_max', 800)
+
     # Learning rate scheduler
     warmup_epochs = args.warmup_epochs
     lr_warmup_factor = 1.0 / warmup_epochs
@@ -112,6 +125,20 @@ def train(args):
         T_mult=2,
         eta_min=args.lr * 0.01
     )
+
+    # EMA setup
+    use_ema = getattr(args, 'use_ema', True)
+    ema_decay = getattr(args, 'ema_decay', 0.9998)
+    ema_state = None
+    if use_ema:
+        ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    def _ema_update():
+        if not use_ema:
+            return
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=1.0 - ema_decay)
     
     # Loss functions
     criterion = YOLOXLoss(
@@ -151,6 +178,13 @@ def train(args):
             targets_xyxy = [t.to(device) for t in targets_xyxy]
             
             optimizer.zero_grad()
+            # Optionally resize on-the-fly for multi-scale
+            if multiscale:
+                short_side = np.random.randint(ms_min // 32, ms_max // 32 + 1) * 32
+                images = torch.nn.functional.interpolate(
+                    images, size=(short_side, short_side), mode='bilinear', align_corners=False
+                )
+
             outputs = model(images)
             
             # Calculate loss
@@ -185,6 +219,7 @@ def train(args):
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            _ema_update()
             
             train_loss += total_loss.item()
             train_detection_loss += total_loss.item()
@@ -194,17 +229,63 @@ def train(args):
         val_loss = 0.0
         val_detection_loss = 0.0
         val_severity_loss = 0.0
+        per_class_aps = None
         
         with torch.no_grad():
+            # Optionally evaluate EMA weights
+            orig_state = None
+            if use_ema and ema_state is not None:
+                orig_state = {k: v.clone() for k, v in model.state_dict().items()}
+                model.load_state_dict(ema_state, strict=False)
+
+            all_outputs = []
+            all_targets = []
             for images, targets_xyxy in tqdm(val_loader, desc="Validating"):
                 images = images.to(device)
                 targets_xyxy = [t.to(device) for t in targets_xyxy]
-                
                 outputs = model(images)
                 val_loss_batch = criterion(outputs, targets_xyxy)
                 val_loss += val_loss_batch.item()
                 val_detection_loss += val_loss_batch.item()
+                all_outputs.append(outputs)
+                all_targets.extend(targets_xyxy)
+
+            # Compute mAP@0.5 similar to train.py
+            # Flatten outputs across batches per FPN into a single list of levels
+            # outputs is a list of tensors [levels], each: [N, C, H, W]
+            # Concatenate along N for each level
+            per_level = None
+            for batch_out in all_outputs:
+                if per_level is None:
+                    per_level = [bo for bo in batch_out]
+                else:
+                    per_level = [torch.cat((a, b), dim=0) for a, b in zip(per_level, batch_out)]
+
+            # Postprocess using strides from model
+            final_detections = postprocess(
+                per_level, model.stride.to(device), args.num_classes, conf_thre=0.25
+            )
+
+            per_class_aps = np.zeros(args.num_classes)
+            for i in range(len(final_detections)):
+                pred_results_np = final_detections[i].detach().cpu().numpy()
+                if i < len(all_targets):
+                    gt = all_targets[i].detach().cpu().numpy()
+                    if gt.shape[0] > 0:
+                        gt_boxes = gt[:, :4]
+                        gt_classes = gt[:, 4]
+                        aps = calculate_map_per_class(
+                            pred_results_np, gt_boxes, gt_classes, args.num_classes
+                        )
+                        per_class_aps += np.array(aps)
+            num_gt_images = sum(1 for gt in all_targets if gt.shape[0] > 0)
+            if num_gt_images > 0:
+                per_class_aps /= num_gt_images
         
+        # Restore original weights after EMA eval
+        if use_ema and ema_state is not None and orig_state is not None:
+            model.load_state_dict(orig_state, strict=False)
+
         # Scheduler step
         if epoch >= warmup_epochs:
             scheduler.step()
@@ -216,23 +297,44 @@ def train(args):
         avg_train_severity_loss = train_severity_loss / len(train_loader)
         
         # Logging
-        logger.info(
-            f"Epoch {epoch + 1}/{args.epochs} | "
-            f"Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {avg_val_loss:.4f} | "
-            f"Detection Loss: {avg_train_detection_loss:.4f} | "
-            f"Severity Loss: {avg_train_severity_loss:.4f} | "
-            f"LR: {optimizer.param_groups[0]['lr']:.2e}"
-        )
+        if per_class_aps is not None:
+            mean_ap = float(np.mean(per_class_aps))
+            curl1_indicator = ("🔴" if per_class_aps[0] < 0.5 else "🟡" if per_class_aps[0] < 0.8 else "🟢")
+            logger.info(
+                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {avg_val_loss:.4f} | "
+                f"mAP@0.5: {mean_ap:.4f} | "
+                f"{curl1_indicator} AP (Curl stage-1): {per_class_aps[0]:.4f} | "
+                f"AP (Curl stage-2): {per_class_aps[1]:.4f} | "
+                f"AP (Healthy): {per_class_aps[2]:.4f} | "
+                f"AP (Leaf Enation): {per_class_aps[3]:.4f} | "
+                f"AP (Sooty): {per_class_aps[4]:.4f} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
+        else:
+            logger.info(
+                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {avg_val_loss:.4f} | "
+                f"Detection Loss: {avg_train_detection_loss:.4f} | "
+                f"Severity Loss: {avg_train_severity_loss:.4f} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}"
+            )
         
-        # Early stopping (simplified - using validation loss instead of mAP for now)
+        # Early stopping (using validation loss; lower is better)
         if avg_val_loss < best_map - min_delta:
             best_map = avg_val_loss
             patience_counter = 0
-            torch.save(
-                model.state_dict(), os.path.join(run_save_dir, "best_model.pth")
-            )
-            logger.info(f"New best model saved with Val Loss: {best_map:.4f}")
+            # Save EMA weights if enabled, else save current weights
+            if use_ema and ema_state is not None:
+                torch.save(ema_state, os.path.join(run_save_dir, "best_model.pth"))
+                logger.info(f"New best EMA model saved with Val Loss: {best_map:.4f}")
+            else:
+                torch.save(
+                    model.state_dict(), os.path.join(run_save_dir, "best_model.pth")
+                )
+                logger.info(f"New best model saved with Val Loss: {best_map:.4f}")
         else:
             patience_counter += 1
             logger.info(f"No improvement for {patience_counter} epochs (patience: {patience})")
@@ -313,6 +415,24 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--save_interval", type=int, default=10, help="Save checkpoint every N epochs"
+    )
+    parser.add_argument(
+        "--balanced_sampling", action="store_true", help="Enable class-balanced sampling"
+    )
+    parser.add_argument(
+        "--use_ema", action="store_true", help="Use EMA weights during training and evaluation"
+    )
+    parser.add_argument(
+        "--ema_decay", type=float, default=0.9998, help="EMA decay rate"
+    )
+    parser.add_argument(
+        "--multiscale", action="store_true", help="Enable multi-scale training"
+    )
+    parser.add_argument(
+        "--ms_min", type=int, default=480, help="Min short side for multi-scale"
+    )
+    parser.add_argument(
+        "--ms_max", type=int, default=800, help="Max short side for multi-scale"
     )
 
     try:

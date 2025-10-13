@@ -38,7 +38,11 @@ class GroupNorm(nn.Module):
     """Group Normalization with SiLU activation"""
     def __init__(self, num_channels, num_groups=32):
         super().__init__()
-        self.gn = nn.GroupNorm(num_groups, num_channels)
+        # Ensure num_channels is divisible by num_groups by reducing groups if needed
+        groups = min(num_groups, num_channels)
+        while groups > 1 and (num_channels % groups) != 0:
+            groups -= 1
+        self.gn = nn.GroupNorm(groups, num_channels)
         self.act = SiLU()
         
     def forward(self, x):
@@ -50,7 +54,8 @@ class GhostConv(nn.Module):
         super().__init__()
         self.out_channels = out_channels
         init_channels = math.ceil(out_channels / 2)
-        new_channels = init_channels * (groups - 1)
+        # Ensure cheap operation produces the remaining channels (non-zero)
+        new_channels = max(out_channels - init_channels, 1)
         
         self.primary_conv = nn.Conv2d(in_channels, init_channels, kernel_size, stride, padding, groups=1, bias=False)
         self.cheap_operation = nn.Conv2d(init_channels, new_channels, kernel_size=1, groups=init_channels, bias=False)
@@ -74,6 +79,7 @@ class DepthwiseSeparableConv(nn.Module):
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = self.bn(x)
+        x = self.act(x)
         return x
 
 class DropBlock2D(nn.Module):
@@ -251,62 +257,63 @@ class DualSPP(nn.Module):
         return out
 
 class BiFPN(nn.Module):
-    """Bidirectional Feature Pyramid Network with learnable weights"""
+    """Bidirectional Feature Pyramid Network with learnable weights and channel alignment"""
     def __init__(self, channels_list, num_layers=2):
         super().__init__()
         self.num_layers = num_layers
         self.channels_list = channels_list
-        
+        # Unify all feature maps to the same channel dimension for add-based fusion
+        self.out_c = channels_list[0]  # use smallest level channels as common dimension
+
+        # Per-level 1x1 conv to align channels
+        self.adjust_convs = nn.ModuleList([
+            nn.Conv2d(c_in, self.out_c, kernel_size=1, stride=1, padding=0, bias=False)
+            for c_in in channels_list
+        ])
+
         # Learnable weights for feature fusion
         self.weights = nn.ParameterList([
             nn.Parameter(torch.ones(2, dtype=torch.float32)) for _ in range(num_layers)
         ])
-        
-        # Top-down pathway
-        self.top_down_convs = nn.ModuleList()
-        for i in range(len(channels_list) - 1):
-            self.top_down_convs.append(
-                DepthwiseSeparableConv(channels_list[i], channels_list[i+1])
-            )
-        
-        # Bottom-up pathway
-        self.bottom_up_convs = nn.ModuleList()
-        for i in range(len(channels_list) - 1):
-            self.bottom_up_convs.append(
-                DepthwiseSeparableConv(channels_list[i+1], channels_list[i])
-            )
+
+        # Top-down and Bottom-up pathway convs (keep channel dim constant)
+        self.top_down_convs = nn.ModuleList([
+            DepthwiseSeparableConv(self.out_c, self.out_c) for _ in range(len(channels_list) - 1)
+        ])
+        self.bottom_up_convs = nn.ModuleList([
+            DepthwiseSeparableConv(self.out_c, self.out_c) for _ in range(len(channels_list) - 1)
+        ])
 
     def forward(self, features):
+        # Align channels for all input features first
+        feats = [adj(f) for adj, f in zip(self.adjust_convs, features)]
+
         # Top-down pathway
         top_down_features = []
-        for i in range(len(features) - 1):
+        for i in range(len(feats)):
             if i == 0:
-                top_down_features.append(features[i])
+                top_down_features.append(feats[i])
             else:
-                # Weighted fusion
                 weight = F.relu(self.weights[i-1])
                 weight = weight / (weight.sum() + 1e-8)
-                
-                fused = weight[0] * features[i] + weight[1] * F.interpolate(
-                    top_down_features[-1], size=features[i].shape[2:], mode='nearest'
+                fused = weight[0] * feats[i] + weight[1] * F.interpolate(
+                    top_down_features[-1], size=feats[i].shape[2:], mode='nearest'
                 )
                 top_down_features.append(self.top_down_convs[i-1](fused))
-        
+
         # Bottom-up pathway
         bottom_up_features = []
         for i in range(len(top_down_features) - 1, -1, -1):
             if i == len(top_down_features) - 1:
                 bottom_up_features.append(top_down_features[i])
             else:
-                # Weighted fusion
                 weight = F.relu(self.weights[i])
                 weight = weight / (weight.sum() + 1e-8)
-                
                 fused = weight[0] * top_down_features[i] + weight[1] * F.interpolate(
                     bottom_up_features[-1], size=top_down_features[i].shape[2:], mode='nearest'
                 )
                 bottom_up_features.append(self.bottom_up_convs[i](fused))
-        
+
         return list(reversed(bottom_up_features))
 
 class ASFF(nn.Module):
@@ -396,6 +403,10 @@ class DualBranchHead(nn.Module):
         # Detection branch
         self.detection_convs = nn.ModuleList()
         self.detection_preds = nn.ModuleList()
+        # Regression branch
+        self.reg_stems = nn.ModuleList()
+        self.reg_convs = nn.ModuleList()
+        self.reg_preds = nn.ModuleList()
         
         # Severity branch
         self.severity_convs = nn.ModuleList()
@@ -420,6 +431,16 @@ class DualBranchHead(nn.Module):
             self.detection_preds.append(
                 nn.Conv2d(int(256 * wid_mul), self.n_anchors * self.num_classes, 1, 1, 0)
             )
+
+            # Regression branch (4 bbox channels)
+            self.reg_stems.append(GhostConv(in_ch, int(256 * wid_mul), 1, 1))
+            self.reg_convs.append(nn.Sequential(
+                GhostConv(int(256 * wid_mul), int(256 * wid_mul), 3, 1, 1),
+                GhostConv(int(256 * wid_mul), int(256 * wid_mul), 3, 1, 1),
+            ))
+            self.reg_preds.append(
+                nn.Conv2d(int(256 * wid_mul), self.n_anchors * 4, 1, 1, 0)
+            )
             
             # Severity branch
             self.severity_stems.append(GhostConv(in_ch, int(256 * wid_mul), 1, 1))
@@ -443,6 +464,7 @@ class DualBranchHead(nn.Module):
 
     def forward(self, fpn_feats):
         detection_outputs = []
+        reg_outputs = []
         severity_outputs = []
         obj_outputs = []
         
@@ -452,6 +474,11 @@ class DualBranchHead(nn.Module):
             det_feat = self.detection_convs[i](det_feat)
             det_output = self.detection_preds[i](det_feat)
             
+            # Regression branch
+            reg_feat = self.reg_stems[i](feat)
+            reg_feat = self.reg_convs[i](reg_feat)
+            reg_output = self.reg_preds[i](reg_feat)
+
             # Severity branch
             sev_feat = self.severity_stems[i](feat)
             sev_feat = self.severity_convs[i](sev_feat)
@@ -463,10 +490,11 @@ class DualBranchHead(nn.Module):
             obj_output = self.obj_preds[i](obj_feat)
             
             detection_outputs.append(det_output)
+            reg_outputs.append(reg_output)
             severity_outputs.append(sev_output)
             obj_outputs.append(obj_output)
         
-        return detection_outputs, severity_outputs, obj_outputs
+        return detection_outputs, severity_outputs, obj_outputs, reg_outputs
 
 # ============================================================================
 # YOLOX-M++ ARCHITECTURE
@@ -537,49 +565,48 @@ class YOLOXMPPNeck(nn.Module):
         super().__init__()
         self.depth = dep_mul
         self.width = wid_mul
+        # Match backbone outputs: dark2,3,4,5 channels = base_channels*[2,4,8,16]
+        # base_channels = int(wid_mul * 64) -> channels = wid_mul * [128, 256, 512, 1024]
         in_channels = [
-            int(self.width * 192),   # P2 (dark2)
-            int(self.width * 384),   # P3 (dark3)
-            int(self.width * 768),   # P4 (dark4)
-            int(self.width * 1536),  # P5 (dark5)
+            int(self.width * 128),   # P2 (dark2)
+            int(self.width * 256),   # P3 (dark3)
+            int(self.width * 512),   # P4 (dark4)
+            int(self.width * 1024),  # P5 (dark5)
         ]
 
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
-        # Lateral convolutions
-        self.lateral_convs = nn.ModuleList()
-        for i in range(len(in_channels) - 1):
-            self.lateral_convs.append(
-                GhostConv(in_channels[i+1], in_channels[i], 1, 1)
-            )
+        # Lateral and reduction convolutions for top-down pathway
+        self.lateral_p5 = GhostConv(in_channels[3], in_channels[2], 1, 1)
+        self.reduce_p4 = GhostConv(in_channels[2] * 2, in_channels[2], 1, 1)
+        self.reduce_p3 = GhostConv(in_channels[2] + in_channels[1], in_channels[1], 1, 1)
+        self.reduce_p2 = GhostConv(in_channels[1] + in_channels[0], in_channels[0], 1, 1)
 
         # BiFPN
         self.bifpn = BiFPN(in_channels, num_layers=3)
         
-        # ASFF for feature fusion
+        # ASFF for feature fusion (use unified channel dim from BiFPN)
         self.asff_convs = nn.ModuleList()
         for i in range(len(in_channels)):
-            self.asff_convs.append(ASFF(i, in_channels[i]))
+            self.asff_convs.append(ASFF(i, self.bifpn.out_c))
 
     def forward(self, input):
         out_features = (input["dark2"], input["dark3"], input["dark4"], input["dark5"])
         p2, p3, p4, p5 = out_features
 
-        # Top-down pathway
-        fpn_out3 = self.lateral_convs[0](p5)
-        fpn_out3 = self.upsample(fpn_out3)
-        fpn_out3 = torch.cat([fpn_out3, p4], 1)
+        # Top-down pathway: reduce to expected channels after each concat
+        td_p4 = self.lateral_p5(p5)
+        td_p4 = torch.cat([F.interpolate(td_p4, size=p4.shape[2:], mode='nearest'), p4], 1)
+        td_p4 = self.reduce_p4(td_p4)
 
-        fpn_out2 = self.lateral_convs[1](fpn_out3)
-        fpn_out2 = self.upsample(fpn_out2)
-        fpn_out2 = torch.cat([fpn_out2, p3], 1)
+        td_p3 = torch.cat([F.interpolate(td_p4, size=p3.shape[2:], mode='nearest'), p3], 1)
+        td_p3 = self.reduce_p3(td_p3)
 
-        fpn_out1 = self.lateral_convs[2](fpn_out2)
-        fpn_out1 = self.upsample(fpn_out1)
-        fpn_out1 = torch.cat([fpn_out1, p2], 1)
+        td_p2 = torch.cat([F.interpolate(td_p3, size=p2.shape[2:], mode='nearest'), p2], 1)
+        td_p2 = self.reduce_p2(td_p2)
 
         # BiFPN processing
-        features = [fpn_out1, fpn_out2, fpn_out3, p5]
+        features = [td_p2, td_p3, td_p4, p5]
         bifpn_features = self.bifpn(features)
 
         # ASFF fusion
@@ -609,25 +636,30 @@ class YOLOXMPP(nn.Module):
 
         self.backbone = CSPDarknetX(dep_mul, wid_mul)
         self.neck = YOLOXMPPNeck(dep_mul, wid_mul)
-        in_channels = [int(wid_mul * 192), int(wid_mul * 384), int(wid_mul * 768), int(wid_mul * 1536)]
-        self.head = DualBranchHead(num_classes, num_severity_levels=5, wid_mul, in_channels)
+
+# BiFPN unifies channels to neck.bifpn.out_c; the neck returns features with that channel count
+        bifpn_out_c = self.neck.bifpn.out_c
+# head expects one in_channel value per FPN level — use the unified channel for all scales
+        head_in_channels = [bifpn_out_c] * 4
+
+        self.head = DualBranchHead(num_classes, num_severity_levels=5, wid_mul=wid_mul, in_channels=head_in_channels)
+
         self.stride = torch.tensor([4.0, 8.0, 16.0, 32.0])  # 4 scales including P2
 
     def forward(self, x):
         fpn_features = self.backbone(x)
         pan_features = self.neck(fpn_features)
-        detection_outputs, severity_outputs, obj_outputs = self.head(pan_features)
+        detection_outputs, severity_outputs, obj_outputs, reg_outputs = self.head(pan_features)
         
         # Combine outputs for compatibility
         combined_outputs = []
         for i in range(len(detection_outputs)):
-            # Format: [reg, obj, cls, severity]
+            # Standard YOLOX layout: [reg(4), obj(1), cls(num_classes)]
             combined = torch.cat([
-                torch.zeros_like(detection_outputs[i][:, :4]),  # reg (placeholder)
-                obj_outputs[i], 
-                detection_outputs[i], 
-                severity_outputs[i]
-            ], 1)
+                reg_outputs[i],
+                obj_outputs[i],
+                detection_outputs[i]
+            ], dim=1)
             combined_outputs.append(combined)
         
         return combined_outputs

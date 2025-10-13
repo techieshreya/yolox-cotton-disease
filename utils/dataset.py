@@ -55,7 +55,7 @@ def get_val_augs(input_size):
 # -------------------------------------------------------------------
 
 class CottonDiseaseDataset(Dataset):
-    def __init__(self, data_dir, augmentations, input_size=(640, 640)):
+    def __init__(self, data_dir, augmentations, input_size=(640, 640), mosaic_prob=0.5, mixup_prob=0.15, enable_mosaic=True, enable_mixup=True):
         """
         Args:
             data_dir: Path to directory containing images and XMLs
@@ -65,6 +65,10 @@ class CottonDiseaseDataset(Dataset):
         self.data_dir = data_dir
         self.augmentations = augmentations
         self.input_size = input_size
+        self.mosaic_prob = mosaic_prob
+        self.mixup_prob = mixup_prob
+        self.enable_mosaic = enable_mosaic
+        self.enable_mixup = enable_mixup
         
         self.image_files = []
         for f in sorted(os.listdir(data_dir)):
@@ -72,61 +76,178 @@ class CottonDiseaseDataset(Dataset):
                 xml_file = os.path.splitext(f)[0] + '.xml'
                 if os.path.exists(os.path.join(data_dir, xml_file)):
                     self.image_files.append(f)
+
+        # Precompute class frequencies and per-sample sampling weights for class-balanced sampling
+        self.class_freq = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+        self.sample_weights = []
+        for img_name in self.image_files:
+            xml_path = os.path.join(self.data_dir, os.path.splitext(img_name)[0] + '.xml')
+            targets_list = self._parse_xml(xml_path)
+            if targets_list:
+                labels = [int(t[4]) for t in targets_list]
+                for c in set(labels):
+                    self.class_freq[c] += labels.count(c)
+        # avoid zero
+        for k in self.class_freq:
+            if self.class_freq[k] == 0:
+                self.class_freq[k] = 1
+        for img_name in self.image_files:
+            xml_path = os.path.join(self.data_dir, os.path.splitext(img_name)[0] + '.xml')
+            targets_list = self._parse_xml(xml_path)
+            if not targets_list:
+                self.sample_weights.append(1.0)
+            else:
+                labels = [int(t[4]) for t in targets_list]
+                # weight is mean of inverse frequency
+                invs = [1.0 / float(self.class_freq[c]) for c in labels]
+                self.sample_weights.append(float(sum(invs) / len(invs)))
         
     def __len__(self):
         return len(self.image_files)
     
     def __getitem__(self, idx):
-        img_name = self.image_files[idx]
-        img_path = os.path.join(self.data_dir, img_name)
-        xml_path = os.path.join(self.data_dir, os.path.splitext(img_name)[0] + '.xml')
-        
-        # Load image with OpenCV
-        image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # --- GET THE ACTUAL IMAGE DIMENSIONS ---
-        orig_h, orig_w = image.shape[:2]
-        
-        # Parse XML to get bounding boxes and class labels
-        targets_list = self._parse_xml(xml_path)
-        
-        if not targets_list:
-            targets_np = np.zeros((0, 5), dtype=np.float32)
+        # Decide augmentation strategy
+        use_mosaic = self.enable_mosaic and (np.random.rand() < self.mosaic_prob)
+        if use_mosaic and len(self.image_files) >= 4:
+            image, targets_np = self._load_mosaic_image_and_targets(idx)
+            # Optional MixUp after Mosaic
+            if self.enable_mixup and (np.random.rand() < self.mixup_prob) and len(self.image_files) >= 1:
+                mix_idx = np.random.randint(0, len(self.image_files))
+                mix_image, mix_targets = self._load_image_and_targets(mix_idx)
+                image, targets_np = self._mixup(image, targets_np, mix_image, mix_targets)
         else:
-            targets_np = np.array(targets_list, dtype=np.float32)
-        
-            # --------------------- THE FIX IS HERE ---------------------
-            # Clip the bounding box coordinates to be within the image dimensions.
-            # This handles annotation errors where boxes are slightly outside the image.
-            targets_np[:, 0] = np.clip(targets_np[:, 0], 0, orig_w)  # x1
-            targets_np[:, 1] = np.clip(targets_np[:, 1], 0, orig_h)  # y1
-            targets_np[:, 2] = np.clip(targets_np[:, 2], 0, orig_w)  # x2
-            targets_np[:, 3] = np.clip(targets_np[:, 3], 0, orig_h)  # y2
-            # -----------------------------------------------------------
+            image, targets_np = self._load_image_and_targets(idx)
 
-        # Separate bboxes and class labels for Albumentations
-        bboxes = targets_np[:, :4]
-        class_labels = targets_np[:, 4]
-        
-        # Apply augmentations
+        # Apply albumentations at the end (resize/normalize/tensor + light augs)
+        bboxes = targets_np[:, :4] if targets_np.size > 0 else []
+        class_labels = targets_np[:, 4] if targets_np.size > 0 else []
         if self.augmentations:
             augmented = self.augmentations(image=image, bboxes=bboxes, class_labels=class_labels)
             image = augmented['image']
             bboxes = augmented['bboxes']
             class_labels = augmented['class_labels']
-            
-        # Re-assemble the targets tensor
+
         if len(bboxes) > 0:
             targets = torch.cat(
-                (torch.tensor(bboxes, dtype=torch.float32), 
-                 torch.tensor(class_labels, dtype=torch.float32).unsqueeze(1)), 
+                (torch.tensor(bboxes, dtype=torch.float32),
+                 torch.tensor(class_labels, dtype=torch.float32).unsqueeze(1)),
                 dim=1
             )
         else:
             targets = torch.zeros((0, 5), dtype=torch.float32)
-            
+
         return image, targets
+
+    def _load_image_and_targets(self, idx):
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.data_dir, img_name)
+        xml_path = os.path.join(self.data_dir, os.path.splitext(img_name)[0] + '.xml')
+
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        h, w = image.shape[:2]
+        targets_list = self._parse_xml(xml_path)
+        if not targets_list:
+            targets_np = np.zeros((0, 5), dtype=np.float32)
+        else:
+            targets_np = np.array(targets_list, dtype=np.float32)
+            targets_np[:, 0] = np.clip(targets_np[:, 0], 0, w)
+            targets_np[:, 1] = np.clip(targets_np[:, 1], 0, h)
+            targets_np[:, 2] = np.clip(targets_np[:, 2], 0, w)
+            targets_np[:, 3] = np.clip(targets_np[:, 3], 0, h)
+        return image, targets_np
+
+    def _load_mosaic_image_and_targets(self, idx):
+        input_h, input_w = self.input_size
+        yc, xc = [int(np.random.uniform(0.5 * s, 1.5 * s)) for s in (input_h, input_w)]
+
+        indices = [idx] + [np.random.randint(0, len(self.image_files)) for _ in range(3)]
+        mosaic_img = np.full((input_h * 2, input_w * 2, 3), 114, dtype=np.uint8)
+        mosaic_targets = []
+
+        for i, index in enumerate(indices):
+            img, targets = self._load_image_and_targets(index)
+            h, w = img.shape[:2]
+
+            scale = np.random.uniform(0.4, 1.0)
+            new_h, new_w = int(h * scale), int(w * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            if i == 0:  # top left
+                x1a, y1a, x2a, y2a = max(xc - new_w, 0), max(yc - new_h, 0), xc, yc
+                x1b, y1b, x2b, y2b = new_w - (x2a - x1a), new_h - (y2a - y1a), new_w, new_h
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - new_h, 0), min(xc + new_w, 2 * input_w), yc
+                x1b, y1b, x2b, y2b = 0, new_h - (y2a - y1a), min(new_w, x2a - x1a), new_h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - new_w, 0), yc, xc, min(yc + new_h, 2 * input_h)
+                x1b, y1b, x2b, y2b = new_w - (x2a - x1a), 0, new_w, min(y2a - y1a, new_h)
+            else:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + new_w, 2 * input_w), min(yc + new_h, 2 * input_h)
+                x1b, y1b, x2b, y2b = 0, 0, min(new_w, x2a - x1a), min(new_h, y2a - y1a)
+
+            mosaic_img[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+
+            padw, padh = x1a - x1b, y1a - y1b
+            if targets.size > 0:
+                boxes = targets[:, :4].copy()
+                classes = targets[:, 4:5].copy()
+                boxes[:, 0] = boxes[:, 0] * (new_w / w) + padw
+                boxes[:, 1] = boxes[:, 1] * (new_h / h) + padh
+                boxes[:, 2] = boxes[:, 2] * (new_w / w) + padw
+                boxes[:, 3] = boxes[:, 3] * (new_h / h) + padh
+                merged = np.hstack((boxes, classes))
+                mosaic_targets.append(merged)
+
+        if len(mosaic_targets) > 0:
+            mosaic_targets = np.concatenate(mosaic_targets, axis=0)
+            # Clip boxes to the mosaic image
+            np.clip(mosaic_targets[:, 0], 0, 2 * input_w, out=mosaic_targets[:, 0])
+            np.clip(mosaic_targets[:, 1], 0, 2 * input_h, out=mosaic_targets[:, 1])
+            np.clip(mosaic_targets[:, 2], 0, 2 * input_w, out=mosaic_targets[:, 2])
+            np.clip(mosaic_targets[:, 3], 0, 2 * input_h, out=mosaic_targets[:, 3])
+            # Remove invalid or tiny boxes
+            bw = mosaic_targets[:, 2] - mosaic_targets[:, 0]
+            bh = mosaic_targets[:, 3] - mosaic_targets[:, 1]
+            keep = (bw > 2) & (bh > 2)
+            mosaic_targets = mosaic_targets[keep]
+        else:
+            mosaic_targets = np.zeros((0, 5), dtype=np.float32)
+
+        # Center crop to original input size
+        x_start = max(xc - input_w // 2, 0)
+        y_start = max(yc - input_h // 2, 0)
+        x_end = x_start + input_w
+        y_end = y_start + input_h
+        mosaic_img = mosaic_img[y_start:y_end, x_start:x_end]
+
+        if mosaic_targets.size > 0:
+            mosaic_targets[:, [0, 2]] -= x_start
+            mosaic_targets[:, [1, 3]] -= y_start
+            mosaic_targets[:, 0] = np.clip(mosaic_targets[:, 0], 0, input_w)
+            mosaic_targets[:, 1] = np.clip(mosaic_targets[:, 1], 0, input_h)
+            mosaic_targets[:, 2] = np.clip(mosaic_targets[:, 2], 0, input_w)
+            mosaic_targets[:, 3] = np.clip(mosaic_targets[:, 3], 0, input_h)
+
+        return mosaic_img, mosaic_targets.astype(np.float32)
+
+    def _mixup(self, img1, targets1, img2, targets2, alpha=0.2):
+        lam = np.random.beta(alpha, alpha)
+        h = max(img1.shape[0], img2.shape[0])
+        w = max(img1.shape[1], img2.shape[1])
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        out[:img1.shape[0], :img1.shape[1]] = img1
+        out[:img2.shape[0], :img2.shape[1]] = (lam * out[:img2.shape[0], :img2.shape[1]] + (1 - lam) * img2).astype(np.uint8)
+
+        # Simply concatenate boxes; labels unaffected
+        if targets1.size == 0 and targets2.size == 0:
+            return out, np.zeros((0, 5), dtype=np.float32)
+        if targets1.size == 0:
+            return out, targets2
+        if targets2.size == 0:
+            return out, targets1
+        merged = np.concatenate([targets1, targets2], axis=0)
+        return out, merged.astype(np.float32)
 
     
     def _parse_xml(self, xml_path):
