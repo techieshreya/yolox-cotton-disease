@@ -121,6 +121,20 @@ class CottonDiseaseDataset(Dataset):
         # Apply albumentations at the end (resize/normalize/tensor + light augs)
         bboxes = targets_np[:, :4] if targets_np.size > 0 else []
         class_labels = targets_np[:, 4] if targets_np.size > 0 else []
+        
+        # Validate bounding boxes before augmentation
+        if len(bboxes) > 0:
+            valid_bboxes = []
+            valid_labels = []
+            for i, bbox in enumerate(bboxes):
+                x_min, y_min, x_max, y_max = bbox
+                # Check if bbox is valid (x_max > x_min and y_max > y_min)
+                if x_max > x_min and y_max > y_min:
+                    valid_bboxes.append(bbox)
+                    valid_labels.append(class_labels[i])
+            bboxes = valid_bboxes
+            class_labels = valid_labels
+        
         if self.augmentations:
             augmented = self.augmentations(image=image, bboxes=bboxes, class_labels=class_labels)
             image = augmented['image']
@@ -155,6 +169,12 @@ class CottonDiseaseDataset(Dataset):
             targets_np[:, 1] = np.clip(targets_np[:, 1], 0, h)
             targets_np[:, 2] = np.clip(targets_np[:, 2], 0, w)
             targets_np[:, 3] = np.clip(targets_np[:, 3], 0, h)
+            
+            # Remove invalid bounding boxes after clipping
+            bw = targets_np[:, 2] - targets_np[:, 0]
+            bh = targets_np[:, 3] - targets_np[:, 1]
+            keep = (bw > 2) & (bh > 2)
+            targets_np = targets_np[keep]
         return image, targets_np
 
     def _load_mosaic_image_and_targets(self, idx):
@@ -228,6 +248,12 @@ class CottonDiseaseDataset(Dataset):
             mosaic_targets[:, 1] = np.clip(mosaic_targets[:, 1], 0, input_h)
             mosaic_targets[:, 2] = np.clip(mosaic_targets[:, 2], 0, input_w)
             mosaic_targets[:, 3] = np.clip(mosaic_targets[:, 3], 0, input_h)
+            
+            # Remove invalid bounding boxes after clipping
+            bw = mosaic_targets[:, 2] - mosaic_targets[:, 0]
+            bh = mosaic_targets[:, 3] - mosaic_targets[:, 1]
+            keep = (bw > 2) & (bh > 2)
+            mosaic_targets = mosaic_targets[keep]
 
         return mosaic_img, mosaic_targets.astype(np.float32)
 

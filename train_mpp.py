@@ -10,11 +10,170 @@ import matplotlib.patches as patches
 import time
 import logging
 import datetime
+import torchvision
 
 # Local imports
 from utils.dataset import CottonDiseaseDataset, get_train_augs, get_val_augs
 from utils.loss import YOLOXLoss, severity_aware_loss, multi_task_loss
 from models.yolox_mpp import YOLOXMPP
+
+def calculate_iou(box1, boxes):
+    """Calculate IoU between box1 and boxes"""
+    x1 = np.maximum(box1[0], boxes[:, 0])
+    y1 = np.maximum(box1[1], boxes[:, 1])
+    x2 = np.minimum(box1[2], boxes[:, 2])
+    y2 = np.minimum(box1[3], boxes[:, 3])
+    intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    union = area1 + area2 - intersection
+    return intersection / (union + 1e-6)
+
+def calculate_map(pred_results, true_boxes, true_classes, iou_threshold=0.5):
+    """Calculate mAP for a single class"""
+    if pred_results.shape[0] == 0:
+        return 0.0 if true_boxes.shape[0] > 0 else 1.0
+    if true_boxes.shape[0] == 0:
+        return 0.0
+
+    pred_boxes = pred_results[:, :4]
+    pred_scores = pred_results[:, 4]
+    pred_classes = pred_results[:, 5]
+
+    sorted_ind = np.argsort(-pred_scores)
+    pred_boxes = pred_boxes[sorted_ind]
+    pred_classes = pred_classes[sorted_ind]
+
+    tp = np.zeros(len(pred_boxes))
+    fp = np.zeros(len(pred_boxes))
+    gt_matched = np.zeros(len(true_boxes))
+
+    for i in range(len(pred_boxes)):
+        ious = calculate_iou(pred_boxes[i], true_boxes)
+        best_gt_idx = np.argmax(ious)
+        best_iou = ious[best_gt_idx]
+
+        if best_iou >= iou_threshold and gt_matched[best_gt_idx] == 0:
+            tp[i] = 1
+            gt_matched[best_gt_idx] = 1
+        else:
+            fp[i] = 1
+
+    tp_cumsum = np.cumsum(tp)
+    fp_cumsum = np.cumsum(fp)
+    recalls = tp_cumsum / len(true_boxes)
+    precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)
+
+    # Calculate AP using 11-point interpolation
+    ap = 0
+    for t in np.arange(0, 1.1, 0.1):
+        if np.sum(recalls >= t) == 0:
+            p = 0
+        else:
+            p = np.max(precisions[recalls >= t])
+        ap += p / 11
+
+    return ap
+
+def calculate_map_per_class(pred_results, true_boxes, true_classes, num_classes, iou_threshold=0.5):
+    """Calculate mAP for each class"""
+    aps = []
+    for cls in range(num_classes):
+        pred_mask = pred_results[:, 5] == cls
+        gt_mask = true_classes == cls
+        ap = calculate_map(
+            pred_results[pred_mask],
+            true_boxes[gt_mask],
+            true_classes[gt_mask],
+            iou_threshold,
+        )
+        aps.append(ap)
+    return aps
+
+def postprocess(predictions, strides, num_classes, conf_thre=0.25, nms_thre=0.5):
+    """
+    Post-processes raw predictions from the model.
+    'predictions': A list of 3 tensors, one for each FPN level.
+                   Each tensor is of shape [N, C, H, W] where N is the total number of images.
+    'strides': A tensor of strides for each FPN level.
+    """
+    all_detections = []
+    device = predictions[0].device
+
+    # 1. Decode predictions from all levels
+    decoded_preds = []
+    for i, preds_level in enumerate(predictions):
+        stride = strides[i]
+        N, C, H, W = preds_level.shape
+
+        # Create grid
+        yv, xv = torch.meshgrid(
+            [torch.arange(H, device=device), torch.arange(W, device=device)],
+            indexing="ij",
+        )
+        grid = (
+            torch.stack((xv, yv), 2).view(1, H * W, 2).repeat(N, 1, 1)
+        )  # Shape: [N, H*W, 2]
+
+        # Reshape and decode
+        preds_level = preds_level.permute(0, 2, 3, 1).reshape(
+            N, H * W, C
+        )  # Shape: [N, H*W, C]
+
+        box_xy = (preds_level[..., :2] + grid) * stride
+        box_wh = torch.exp(preds_level[..., 2:4]) * stride
+
+        # Combine decoded boxes with obj and cls scores (still logits)
+        decoded_level = torch.cat((box_xy, box_wh, preds_level[..., 4:]), dim=-1)
+        decoded_preds.append(decoded_level)
+
+    output = torch.cat(decoded_preds, dim=1)  # Shape: [N_images, total_anchors, 5+C]
+
+    # 2. Loop through images in the batch to perform NMS
+    for i in range(output.shape[0]):
+        image_preds = output[i]  # Shape: [total_anchors, 5+C]
+
+        # Apply score threshold
+        obj_score = image_preds[:, 4].sigmoid()
+        cls_scores = image_preds[:, 5:].sigmoid()
+
+        class_conf, class_pred = torch.max(cls_scores, 1)
+        conf_mask = (obj_score * class_conf) >= conf_thre
+
+        # Filter predictions
+        image_preds = image_preds[conf_mask]
+        class_conf = class_conf[conf_mask]
+        class_pred = class_pred[conf_mask]
+
+        if len(image_preds) == 0:
+            all_detections.append(torch.zeros((0, 6), device=device))
+            continue
+
+        # Convert to xyxy format
+        box_cxcy = image_preds[:, :2]
+        box_wh = image_preds[:, 2:4]
+        box_xyxy = torch.zeros_like(box_cxcy)
+        box_xyxy[:, 0] = box_cxcy[:, 0] - box_wh[:, 0] / 2  # x1
+        box_xyxy[:, 1] = box_cxcy[:, 1] - box_wh[:, 1] / 2  # y1
+        box_xyxy[:, 2] = box_cxcy[:, 0] + box_wh[:, 0] / 2  # x2
+        box_xyxy[:, 3] = box_cxcy[:, 1] + box_wh[:, 1] / 2  # y2
+
+        # Combine with scores and classes
+        detections = torch.cat([
+            box_xyxy,
+            (obj_score[conf_mask] * class_conf).unsqueeze(1),
+            class_pred.unsqueeze(1).float()
+        ], dim=1)
+
+        # Apply NMS
+        keep_indices = torchvision.ops.nms(
+            detections[:, :4], detections[:, 4], nms_thre
+        )
+        detections = detections[keep_indices]
+
+        all_detections.append(detections)
+
+    return all_detections
 
 def generate_run_id():
     """Generate a unique run ID based on current timestamp"""
@@ -404,7 +563,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=0,
+        default=47,
         help="Number of workers for data loading",
     )
     parser.add_argument(
