@@ -549,7 +549,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=0,
+        default=63,
         help="Number of workers for data loading (0 for Windows is often safest)",
     )
     parser.add_argument(
